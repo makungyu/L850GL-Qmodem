@@ -1,0 +1,14 @@
+#!/bin/sh
+# Firstboot (post-flash): on ipq40xx the dwc3 controller often misses the modem
+# on the very first USB enumeration. If the Fibocom L850-GL (2cb7 MBIM / 8087 NCM)
+# is not present a short while after boot, force one dwc3 re-scan so it is detected.
+# Runs in background so it does not delay boot; self-deletes (exit 0).
+(
+    sleep 25
+    for f in /sys/bus/usb/devices/*/idVendor; do
+        v=$(cat "$f" 2>/dev/null)
+        { [ "$v" = "2cb7" ] || [ "$v" = "8087" ]; } && exit 0
+    done
+    [ -x /usr/bin/xmodem-usb-redetect ] && /usr/bin/xmodem-usb-redetect once
+) >/dev/null 2>&1 &
+exit 0

@@ -1,0 +1,341 @@
+name: "Auto compile with OpenWrt SDK"
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '*'    
+    tags:
+      - 'v*'
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "README.en.md"
+      - ".github/workflows/**"
+      - ".github/**"
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "README*.md"
+      - ".github/workflows/**"
+      - ".github/**"
+
+env:
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  job_auto_tag:
+    runs-on: ubuntu-latest
+    # 只在 main 分支推送且包含 version.mk 文件变更时运行
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      new_tag: ${{ steps.create_tag.outputs.tag_name }}
+      tag_created: ${{ steps.create_tag.outputs.tag_created }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Check if version.mk changed
+      id: check_version_change
+      run: |
+        # 检查version.mk是否在这次提交中被修改
+        if git diff --name-only HEAD~1 HEAD | grep -q "^version\.mk$"; then
+          echo "version.mk was modified in this commit"
+          echo "version_changed=true" >> $GITHUB_OUTPUT
+        else
+          echo "version.mk was not modified in this commit"
+          echo "version_changed=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Extract version from version.mk
+      id: extract_version
+      if: steps.check_version_change.outputs.version_changed == 'true'
+      run: |
+        # 从version.mk文件中提取xmodem_VERSION
+        version=$(grep "^xmodem_VERSION" version.mk | sed 's/xmodem_VERSION:=//' | xargs)
+        echo "Current xmodem_VERSION: $version"
+        echo "version=$version" >> $GITHUB_OUTPUT
+        
+        # 检查version是否为空
+        if [ -z "$version" ]; then
+          echo "Error: Could not extract version from version.mk"
+          exit 1
+        fi
+        
+        # 生成tag名称
+        tag_name="v$version"
+        echo "tag_name=$tag_name" >> $GITHUB_OUTPUT
+        echo "Generated tag name: $tag_name"
+    
+    - name: Check if tag already exists
+      id: check_tag
+      if: steps.check_version_change.outputs.version_changed == 'true'
+      run: |
+        tag_name="${{ steps.extract_version.outputs.tag_name }}"
+        
+        # 检查tag是否已经存在
+        if git tag -l | grep -q "^${tag_name}$"; then
+          echo "Tag $tag_name already exists, skipping tag creation"
+          echo "tag_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "Tag $tag_name does not exist, will create it"
+          echo "tag_exists=false" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Create and push tag
+      id: create_tag
+      if: steps.check_version_change.outputs.version_changed == 'true' && steps.check_tag.outputs.tag_exists == 'false'
+      run: |
+        tag_name="${{ steps.extract_version.outputs.tag_name }}"
+        version="${{ steps.extract_version.outputs.version }}"
+        
+        # 配置git用户信息
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # 创建带注释的tag
+        git tag -a "$tag_name" -m "Release version $version - Auto-generated tag when xmodem_VERSION was updated to $version"
+        
+        # 推送tag到远程仓库
+        git push origin "$tag_name"
+        
+        echo "✅ Successfully created and pushed tag: $tag_name"
+        echo "tag_name=$tag_name" >> $GITHUB_OUTPUT
+        echo "tag_created=true" >> $GITHUB_OUTPUT
+
+  job_prepare:
+    runs-on: ubuntu-latest
+    needs: [job_auto_tag]
+    if: always()  # 总是运行，不管 auto_tag 是否运行或是否成功
+    outputs:
+      branch_name: ${{ steps.determine_push.outputs.branch_name }}
+      tag_name: ${{ steps.determine_push.outputs.tag_name }}
+      push_type: ${{ steps.determine_push.outputs.push_type }}
+      is_pr: ${{ steps.determine_push.outputs.is_pr }}
+
+    steps:
+      - name: Determine push type
+        id: determine_push
+        run: |
+            # 如果 auto_tag job 创建了新标签，使用新标签
+            if [[ "${{ needs.job_auto_tag.outputs.tag_created }}" == "true" ]]; then
+              echo "New tag created: ${{ needs.job_auto_tag.outputs.new_tag }}"
+              echo "tag_name=${{ needs.job_auto_tag.outputs.new_tag }}" >> $GITHUB_OUTPUT
+              echo "push_type=tag" >> $GITHUB_OUTPUT
+            elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+              echo "This is a tag push."
+              echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+              echo "push_type=tag" >> $GITHUB_OUTPUT
+            else
+              echo "This is a branch push."
+              echo "branch_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+              echo "push_type=branch" >> $GITHUB_OUTPUT
+            fi
+            is_pr=$([[ "${{ github.event_name }}" == "pull_request" ]] && echo 1 || echo 0)
+            echo "is_pr=${is_pr}" >> $GITHUB_OUTPUT
+
+      - name: Checkout
+        if: 
+        uses: actions/checkout@v2
+        with:
+          path: 'xmodem'
+
+      - name: Generate Release Note
+        id: update_modem_support_list
+        run: |
+          cd xmodem
+          python3 ./scripts/update_support_list.py temp_support_list ./application/xmodem/files/usr/share/xmodem/modem_support.json
+          mv temp_support_list_release_notes.md ./release_note.md
+      
+      - name: Upload Release Note
+        id: upload_release_note
+        uses: actions/upload-artifact@v4
+        with:
+          name: Release Note
+          path: ./xmodem/release_note.md
+
+  job_build_xmodem:
+    name: Build xmodem (${{ matrix.arch }}, OpenWrt ${{ matrix.target.openwrt_version }}, ${{ matrix.target.package_format }})
+    needs: [job_prepare]
+    if: ${{ always() && needs.job_prepare.result == 'success' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        arch:
+          - aarch64_generic
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - arm_cortex-a7_neon-vfpv4
+          - arm_cortex-a7_vfpv4
+          - arm_cortex-a9_neon
+          - arm_cortex-a15_neon-vfpv4
+          - mipsel_24kc
+          - mips_24kc
+          - x86_64
+        target:
+          - openwrt_version: "24.10.6"
+            package_format: ipk
+          - openwrt_version: "25.12.4"
+            package_format: apk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install helpers
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install zip
+          sudo -E apt-get -qq clean
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: 'xmodem'
+
+      - name: Create Docker build script
+        run: |
+          mkdir -p .github/openwrt-helper
+          cat > .github/openwrt-helper/build-xmodem.sh <<'BUILDSCRIPT'
+          #!/bin/bash
+          set -euxo pipefail
+          cd /builder
+          [ ! -d ./scripts ] && ./setup.sh
+
+          rm -rf /work/openwrt-feed
+          mkdir -p /work/openwrt-feed/lpac
+          cp -a /work/xmodem/version.mk /work/openwrt-feed/
+          cp -a /work/xmodem/application /work/openwrt-feed/
+          cp -a /work/xmodem/luci /work/openwrt-feed/
+          cp -a /work/xmodem/lpac/openwrt-package/. /work/openwrt-feed/lpac/
+
+          echo "src-link xmodem /work/openwrt-feed" >> feeds.conf.default
+          for attempt in 1 2 3; do
+            if ./scripts/feeds update -a; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep $((attempt * 30))
+          done
+          ./scripts/feeds install -a -p xmodem
+
+          cat >> .config <<'CFG'
+          CONFIG_ALL_NONSHARED=n
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_AUTOREMOVE=n
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CFG
+          cat /work/xmodem/.github/workflows/openwrt_package.config >> .config
+          make defconfig
+
+          generic_package=$(cat /work/xmodem/.github/workflows/xmodem_package_generic)
+          arch_package=$(cat /work/xmodem/.github/workflows/xmodem_package_arch)
+          for package in $generic_package $arch_package; do
+            if ! make package/$package/compile V=s -j"$(nproc)"; then
+              make package/$package/compile V=s -j1
+            fi
+          done
+
+          mkdir -p /work/dist
+          find bin/packages/${SDK_ARCH}/xmodem -type f -name "*.${PACKAGE_FORMAT}" -exec cp -v {} /work/dist/ \;
+          artifact="$(find /work/dist -type f -name "*.${PACKAGE_FORMAT}" -print -quit)"
+          test -n "${artifact}"
+          ls -la /work/dist/
+          BUILDSCRIPT
+          chmod +x .github/openwrt-helper/build-xmodem.sh
+
+      - name: Build in OpenWrt SDK
+        id: compile
+        run: |
+          set -euxo pipefail
+          rm -rf dist
+          mkdir -p dist
+          SDK_ARCH="${{ matrix.arch }}"
+          OPENWRT_VERSION="${{ matrix.target.openwrt_version }}"
+          PACKAGE_FORMAT="${{ matrix.target.package_format }}"
+          SDK_IMAGE="openwrt/sdk:${SDK_ARCH}-${OPENWRT_VERSION}"
+          echo "Pulling SDK: ${SDK_IMAGE}"
+          for attempt in 1 2 3; do
+            if docker pull "${SDK_IMAGE}"; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep $((attempt * 20))
+          done
+          docker run --rm \
+            --user root \
+            -e SDK_ARCH="${SDK_ARCH}" \
+            -e PACKAGE_FORMAT="${PACKAGE_FORMAT}" \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -w /builder \
+            "${SDK_IMAGE}" \
+            /bin/bash /work/.github/openwrt-helper/build-xmodem.sh
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      - name: Upload xmodem
+        if: ${{ steps.compile.outputs.status == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xmodem-${{ matrix.arch }}_${{ matrix.target.package_format }}
+          path: dist/*
+          retention-days: 7
+
+  job_release_artifacts:
+    name: Release Artifacts
+    needs: [job_build_xmodem, job_prepare]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.job_build_xmodem.result == 'success' && needs.job_prepare.outputs.push_type == 'tag' }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+        
+      - name: Download Release Note
+        uses: actions/download-artifact@v4
+        with:
+          name: Release Note
+          path: release_note
+
+      - name: Create releases directory
+        run: mkdir -p releases
+
+      - name: Package artifacts into zip files
+        run: |
+          for dir in artifacts/xmodem-*; do
+            if [ -d "$dir" ]; then
+              base_name=$(basename "$dir")
+              build_name=${base_name#xmodem-}
+              package_format=${build_name##*_}
+              arch_name=${build_name%_${package_format}}
+              case "$package_format" in
+                ipk) openwrt_major="openwrt24" ;;
+                apk) openwrt_major="openwrt25" ;;
+                *) openwrt_major="openwrt" ;;
+              esac
+              final_name="${arch_name}-${openwrt_major}.${package_format}"
+              (cd "$dir" && zip -r "${GITHUB_WORKSPACE}/releases/${final_name}.zip" .)
+            fi
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2.2.2
+        if: ${{ needs.job_prepare.outputs.push_type == 'tag' }}
+        with:
+          body_path: release_note/release_note.md
+          generate_release_notes: true
+          tag_name: ${{ needs.job_prepare.outputs.tag_name }}
+          prerelease: ${{ contains(needs.job_prepare.outputs.tag_name, '-beta') || contains(needs.job_prepare.outputs.tag_name, '-rc') }}
+          files: releases/*

@@ -1,0 +1,17 @@
+#!/bin/sh
+# APK post-install — luci-app-lpac
+[ -f /usr/bin/lpac-esim ] && chmod 0755 /usr/bin/lpac-esim 2>/dev/null || true
+
+# Fix directory permissions
+chmod 755 /usr/share/luci/menu.d 2>/dev/null || true
+chmod 755 /usr/share/rpcd/acl.d 2>/dev/null || true
+
+# Reload RPC daemon
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+
+# Clear LuCI cache
+rm -f /tmp/luci-indexcache* >/dev/null 2>&1 || true
+rm -rf /tmp/luci-modulecache >/dev/null 2>&1 || true
+
+logger -t lpac-esim "luci-app-lpac APK installed."
+exit 0

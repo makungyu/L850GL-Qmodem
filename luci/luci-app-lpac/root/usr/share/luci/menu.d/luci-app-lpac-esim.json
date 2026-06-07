@@ -1,0 +1,13 @@
+{
+	"admin/modem/xmodem/esim": {
+		"title": "eSIM",
+		"order": 5.7,
+		"action": {
+			"type": "view",
+			"path": "xmodem/esim"
+		},
+		"depends": {
+			"acl": ["luci-app-lpac-esim"]
+		}
+	}
+}

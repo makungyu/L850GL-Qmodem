@@ -1,0 +1,22 @@
+config lpac-esim 'main'
+	# APDU backend: qmi | at | mbim
+	option apdu_backend     'qmi'
+
+	# QMI (primary)
+	option qmi_device       '/dev/cdc-wdm0'
+	option qmi_sim_slot     '1'
+
+	# AT (fallback for reboot cascade)
+	option at_device        '/dev/ttyUSB3'
+
+	# MBIM
+	option mbim_device      '/dev/cdc-wdm0'
+	option mbim_proxy       '0'
+
+	# Reboot method: 'script' means lpac-esim-qmi handles cascade
+	option reboot_method    'script'
+
+	# Debug flags
+	option apdu_debug       '0'
+	option http_debug       '0'
+	option at_debug         '0'

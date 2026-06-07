@@ -1,0 +1,45 @@
+#!/bin/sh
+# XModem USB re-detect watchdog (ipq40xx / dwc3).
+# When the host controller misses a modem USB re-enumeration (warm reset via
+# AT+CFUN=1,1 or a random modem hang), rebind the dwc3 controller to force a
+# bus re-scan -- the software equivalent of unplug/replug.
+VIDS="2cb7 8087"        # L850-GL: 2cb7 (MBIM mode), 8087 (NCM mode)
+SLEEP=15
+DEBOUNCE=4              # absent for ~DEBOUNCE*SLEEP s before rebinding
+
+modem_expected(){ uci -q show xmodem 2>/dev/null | grep -q '\.manufacturer='; }
+present(){
+    for f in /sys/bus/usb/devices/*/idVendor; do
+        v=$(cat "$f" 2>/dev/null)
+        for w in $VIDS; do [ "$v" = "$w" ] && return 0; done
+    done
+    return 1
+}
+rebind(){
+    for drv in dwc3 dwc3-qcom; do
+        d="/sys/bus/platform/drivers/$drv"
+        [ -d "$d" ] || continue
+        for c in "$d"/*.usb; do
+            [ -e "$c" ] || continue
+            n=$(basename "$c")
+            echo "$n" > "$d/unbind" 2>/dev/null; sleep 2
+            echo "$n" > "$d/bind" 2>/dev/null
+        done
+        sleep 8
+        present && return 0
+    done
+    present
+}
+[ "$1" = "once" ] && { rebind && echo "re-detected" || echo "failed"; exit $?; }
+# service mode: only meaningful on dwc3-based SoCs (ipq40xx/ipq806x/...)
+ls /sys/bus/platform/drivers/dwc3*/*.usb >/dev/null 2>&1 || { logger -t xmodem-usbwd "no dwc3 controller, watchdog idle"; exit 0; }
+miss=0
+while true; do
+    if modem_expected && ! present; then miss=$((miss+1)); else miss=0; fi
+    if [ "$miss" -ge "$DEBOUNCE" ]; then
+        logger -t xmodem-usbwd "modem absent ~$((DEBOUNCE*SLEEP))s -> rebind dwc3"
+        if rebind; then logger -t xmodem-usbwd "modem re-detected"; else logger -t xmodem-usbwd "rebind failed, retry"; fi
+        miss=0
+    fi
+    sleep "$SLEEP"
+done

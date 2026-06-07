@@ -1,0 +1,39 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/xmodem-esim-bot
+
+start_service() {
+    local enabled
+    enabled=$(uci -q get xmodem_esim_bot.main.enabled)
+    [ "$enabled" != "1" ] && return 0
+
+    local token
+    token=$(uci -q get xmodem_esim_bot.main.token)
+    [ -z "$token" ] && return 0
+
+    procd_open_instance
+    procd_set_param command $PROG
+    procd_set_param respawn 60 10 5
+    procd_set_param stdout 0
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    local pid_file="/var/run/xmodem-esim-bot.pid"
+    [ -f "$pid_file" ] && kill $(cat "$pid_file") 2>/dev/null
+    rm -f "$pid_file"
+}
+
+service_triggers() {
+    procd_add_reload_trigger "xmodem_esim_bot"
+}
+
+reload_service() {
+    stop
+    start
+}

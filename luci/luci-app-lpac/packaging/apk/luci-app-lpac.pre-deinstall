@@ -1,0 +1,7 @@
+#!/bin/sh
+# APK pre-deinstall — luci-app-lpac
+rm -f /tmp/luci-indexcache* >/dev/null 2>&1 || true
+rm -rf /tmp/luci-modulecache >/dev/null 2>&1 || true
+
+logger -t lpac-esim "Removing luci-app-lpac APK."
+exit 0

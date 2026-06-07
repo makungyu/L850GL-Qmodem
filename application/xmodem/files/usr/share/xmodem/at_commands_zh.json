@@ -1,0 +1,86 @@
+{
+    "general": [
+        {
+            "Date Build;ATI": "ATI"
+        },
+        {
+            "Firmware Version;ATI8": "ATI8"
+        },
+        {
+            "IMEI;AT+CGSN": "AT+CGSN"
+        },
+        {
+            "IMSI SIM;AT+CIMI": "AT+CIMI"
+        },
+        {
+            "QOS;AT+CGEQNEG": "AT+CGEQNEG"
+        },
+        {
+            "APN;AT+XLCSSTOREAPN?": "AT+XLCSSTOREAPN?"
+        },
+        {
+            "CPU;AT+GTCPUTYPE=?": "AT+GTCPUTYPE=?"
+        },
+        {
+            "Error check;AT+NEER": "AT+NEER"
+        },
+        {
+            "Error check1;AT+XEER": "AT+XEER"
+        },
+        {
+            "Signal;AT+CESQ": "AT+CESQ"
+        },
+        {
+            "Signal RSSI;AT+CSQ?": "AT+CSQ?"
+        },
+        {
+            "Signal RSRQ & RSRP;AT+XCESQ?": "AT+XCESQ?"
+        },
+        {
+            "Current Band;AT+XCCINFO?": "AT+XCCINFO?"
+        },
+        {
+            "CA Band;AT+GTCAINFO?": "AT+GTCAINFO?"
+        },
+        {
+            "Current Band;AT+XACT?": "AT+XACT?"
+        },
+        {
+            "Volt;AT+CBC": "AT+CBC"
+        },
+        {
+            "Modem Mode;AT+GTUSBMODE?": "AT+GTUSBMODE?"
+        },
+        {
+            "Mode NCM;AT+GTUSBMODE=0": "AT+GTUSBMODE=0"
+        },
+        {
+            "Mode MBIM;AT+GTUSBMODE=7": "AT+GTUSBMODE=7"
+        },
+        {
+            "Airplane Mode;AT+CFUN=4": "AT+CFUN=4"
+        },
+        {
+            "Unmode Airplane;AT+CFUN=1": "AT+CFUN=1"
+        },
+        {
+            "Restart Modem;AT+CFUN=15": "AT+CFUN=15"
+        }
+    ],
+    "fibocom": {
+        "intel": [
+            {
+                "WCDMA Only All Band;AT+XACT=1,,,0": "AT+XACT=1,,,0"
+            },
+            {
+                "LTE Only All Band;AT+XACT=2,,,0": "AT+XACT=2,,,0"
+            },
+            {
+                "WCDMA & LTE All Band;AT+XACT=4,,,0": "AT+XACT=4,,,0"
+            },
+            {
+                "B1, B3 & B5;AT+XACT=2,,,101,103,105": "AT+XACT=2,,,101,103,105"
+            }
+        ]
+    }
+}

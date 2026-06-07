@@ -1,0 +1,31 @@
+{
+	"xmodem": {
+		"description": "XModem control interface",
+		"read": {
+			"ubus": {
+				"xmodem": [
+					"*"
+				],
+				"rc": [
+					"list"
+				],
+				"luci": [
+					"setInitAction"
+				]
+			}
+		},
+		"write": {
+			"ubus": {
+				"xmodem": [
+					"*"
+				],
+				"rc": [
+					"list"
+				],
+				"luci": [
+					"setInitAction"
+				]
+			}
+		}
+	}
+}

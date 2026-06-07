@@ -1,0 +1,26 @@
+config lpac-esim 'main'
+	# APDU backend: qmi | at | mbim
+	option apdu_backend     'mbim'
+
+	# QMI (alternative)
+	option qmi_device       '/dev/cdc-wdm0'
+	option qmi_sim_slot     '1'
+	option sim_slot         '0'
+
+	# AT (fallback for reboot cascade)
+	option at_device        '/dev/ttyUSB2'
+
+	# MBIM (primary for XModem + lpac L850GL/T99W175)
+	option mbim_device      '/dev/cdc-wdm0'
+	option mbim_proxy       '1'
+
+	# Reboot method: 'script' means lpac-esim handles cascade
+	option reboot_method    'script'
+
+	# L850GL/T99W175 specific: skip slot mapping
+	option skip_slot_mapping '1'
+
+	# Debug flags
+	option apdu_debug       '0'
+	option http_debug       '0'
+	option at_debug         '0'

@@ -1,0 +1,123 @@
+{
+	"admin/modem": {
+		"title": "Modem",
+		"order": 25,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-xmodem-next"
+			]
+		}
+	},
+	"admin/modem/xmodem": {
+		"title": "XModem",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "xmodem/overview"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-xmodem-next"
+			]
+		}
+	},
+	"admin/modem/xmodem/overview": {
+		"title": "Status",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "xmodem/overview"
+		}
+	},
+	"admin/modem/xmodem/network_config": {
+		"title": "Network",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "xmodem/network_config"
+		}
+	},
+	"admin/modem/xmodem/config_advanced": {
+		"title": "Advanced",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "xmodem/config_advanced"
+		}
+	},
+	"admin/modem/xmodem/sms": {
+		"title": "SMS",
+		"order": 9,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-xmodem-next"
+			]
+		}
+	},
+	"admin/modem/xmodem/sms/main": {
+		"title": "SMS",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "xmodem/sms"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-xmodem-next"
+			]
+		}
+	},
+	"admin/modem/xmodem/sms/conversation/*": {
+		"title": "SMS Conversation",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "xmodem/sms_conversation"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-xmodem-next"
+			]
+		}
+	},
+	"admin/modem/xmodem/sms/sim": {
+		"title": "SIM Card SMS",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "xmodem/sms_sim"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-xmodem-next"
+			]
+		}
+	},
+	"admin/modem/xmodem/sms/forward": {
+		"title": "SMS Forwarder",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "xmodem/sms_forward"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-xmodem-next"
+			]
+		}
+	},
+	"admin/modem/xmodem/settings": {
+		"title": "Settings",
+		"order": 5,
+		"action": {
+			"type": "view",
+			"path": "xmodem/settings"
+		}
+	}
+}

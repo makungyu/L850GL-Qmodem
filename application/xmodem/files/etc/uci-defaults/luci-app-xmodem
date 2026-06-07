@@ -1,0 +1,22 @@
+#!/bin/sh
+# Copyright (C) 2024 Tom <fjrcn@outlook.com>
+
+/etc/init.d/xmodem_reboot enable
+/etc/init.d/xmodem_usage_stats enable
+
+uci -q batch <<-EOF >/dev/null
+	delete ucitrack.@xmodem[-1]
+	delete ucitrack.@xmodem[-1]
+	add ucitrack xmodem
+	set ucitrack.@xmodem[-1].init=xmodem_network
+	add ucitrack xmodem
+	set ucitrack.@xmodem[-1].init=xmodem_mwan
+	commit ucitrack
+EOF
+
+if [ -f /www/luci-static/resources/luci.js ]; then 
+  rm -f /usr/lib/lua/luci/view/admin_status/index/modem_overview.htm
+fi
+
+rm -rf /tmp/luci-*cache
+exit 0

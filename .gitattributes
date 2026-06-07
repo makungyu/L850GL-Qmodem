@@ -1,0 +1,5 @@
+# Ensure shell/text scripts are stored and checked out with LF so they run
+# correctly on the router (CRLF breaks busybox sh / shebang).
+* text=auto eol=lf
+*.png binary
+*.tar.gz binary
