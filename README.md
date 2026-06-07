@@ -38,5 +38,4 @@ The modem is detected primarily by model name (`AT+CGMM` → `l850-gl`), which w
 
 ## Credits
 
-- Base: [FUjr/XModem](https://github.com/FUjr/XModem)
-- eSIM stack (patched lpac, luci-app-lpac, mbim-proxy, Telegram bot): [AbabilBird/XModem](https://github.com/AbabilBird/XModem)
+- Base: [FUjr/XModem](https://github.com/FUjr/QModem)
