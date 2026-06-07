@@ -32,11 +32,6 @@ Only the packages used by the L850-GL build remain:
 
 All other modems' packages, vendor QMI/MHI kernel drivers, quectel-CM, and unrelated LuCI apps have been removed.
 
-## Build
-
-Built for the Linksys **EA6350v3** (ipq40xx) via [makungyu/nyawit](https://github.com/makungyu/nyawit).
-Required packages: `luci-app-xmodem-next`, `lpac`, `luci-app-lpac`, `xmodem_esim_bot`, `mbim-utils`, plus the usual cellular kmods.
-
 ## Detection note
 
 The modem is detected primarily by model name (`AT+CGMM` → `l850-gl`), which works in both NCM and MBIM modes. `modem_support.json` also lists both USB IDs (`2cb7:0007` MBIM, `8087:095a` NCM) as an AT-fallback safety net.
