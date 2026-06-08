@@ -1,0 +1,269 @@
+#!/bin/sh
+# Ubus RPCD backend for lpac-esim.
+
+. /usr/share/libubox/jshn.sh
+
+BACKEND_SCRIPT="/usr/bin/lpac-esim"
+UCI_LPAC="lpac-esim"
+UCI_TG="xmodem_esim_bot"
+RUN_DIR="/tmp/lpac-esim"
+RUN_LOG="$RUN_DIR/run.log"
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
+}
+
+send_error() {
+	echo "{\"success\":false,\"error\":\"$(json_escape "$1")\"}"
+}
+
+valid_iccid() {
+	echo "$1" | grep -Eq '^[0-9]{18,22}$'
+}
+
+valid_flag() {
+	[ "$1" = "0" ] || [ "$1" = "1" ]
+}
+
+read_input() {
+	INPUT="$(cat)"
+	[ -n "$INPUT" ] || INPUT="{}"
+	json_load "$INPUT" >/dev/null 2>&1
+}
+
+get_lpac_config() {
+	APDU_BACKEND="$(uci -q get "$UCI_LPAC.main.apdu_backend" || echo qmi)"
+	QMI_DEVICE="$(uci -q get "$UCI_LPAC.main.qmi_device" || echo /dev/cdc-wdm0)"
+	QMI_SIM_SLOT="$(uci -q get "$UCI_LPAC.main.qmi_sim_slot" || echo 1)"
+	SIM_SLOT="$(uci -q get "$UCI_LPAC.main.sim_slot" || echo 0)"
+	AT_DEVICE="$(uci -q get "$UCI_LPAC.main.at_device" || echo '')"
+	MBIM_DEVICE="$(uci -q get "$UCI_LPAC.main.mbim_device" || echo /dev/cdc-wdm0)"
+	MBIM_PROXY="$(uci -q get "$UCI_LPAC.main.mbim_proxy" || echo 1)"
+	SKIP_SLOT_MAPPING="$(uci -q get "$UCI_LPAC.main.skip_slot_mapping" || echo 1)"
+	CUSTOM_ISD_R_AID="$(uci -q get "$UCI_LPAC.main.custom_isd_r_aid" || echo '')"
+	REBOOT_METHOD="$(uci -q get "$UCI_LPAC.main.reboot_method" || echo script)"
+	APDU_DEBUG="$(uci -q get "$UCI_LPAC.main.apdu_debug" || echo 0)"
+	HTTP_DEBUG="$(uci -q get "$UCI_LPAC.main.http_debug" || echo 0)"
+	AT_DEBUG="$(uci -q get "$UCI_LPAC.main.at_debug" || echo 0)"
+}
+
+run_lpac() {
+	local command="$1"
+	shift
+	get_lpac_config
+	mkdir -p "$RUN_DIR"
+	[ -f "$RUN_LOG" ] && [ "$(wc -c < "$RUN_LOG" 2>/dev/null)" -gt 262144 ] && : > "$RUN_LOG"
+
+	local command_args="$*"
+	set -- --api --backend "$APDU_BACKEND"
+	case "$APDU_BACKEND" in
+		mbim)
+			set -- "$@" --mbim-device "$MBIM_DEVICE"
+			[ "$MBIM_PROXY" = "1" ] && set -- "$@" --mbim-proxy
+			;;
+		*)
+			set -- "$@" --device "$QMI_DEVICE" --slot "$QMI_SIM_SLOT"
+			;;
+	esac
+	[ -n "$AT_DEVICE" ] && set -- "$@" --at-device "$AT_DEVICE"
+	if [ "$APDU_DEBUG" = "1" ] || [ "$HTTP_DEBUG" = "1" ] || [ "$AT_DEBUG" = "1" ]; then
+		set -- "$@" --verbose
+	fi
+
+	# shellcheck disable=SC2086
+	out=$("$BACKEND_SCRIPT" "$@" "$command" $command_args 2>>"$RUN_LOG")
+	[ -n "$out" ] && echo "$out" || send_error "No response from lpac-esim"
+}
+
+run_lpac_download() {
+	get_lpac_config
+	mkdir -p "$RUN_DIR"
+	set -- --api --backend "$APDU_BACKEND"
+	case "$APDU_BACKEND" in
+		mbim)
+			set -- "$@" --mbim-device "$MBIM_DEVICE"
+			[ "$MBIM_PROXY" = "1" ] && set -- "$@" --mbim-proxy
+			;;
+		*) set -- "$@" --device "$QMI_DEVICE" --slot "$QMI_SIM_SLOT" ;;
+	esac
+	[ -n "$AT_DEVICE" ] && set -- "$@" --at-device "$AT_DEVICE"
+	set -- "$@" download
+	if [ -n "$LPA" ]; then
+		case "$LPA" in LPA:1\$*\$*) ;; *) send_error "Invalid LPA code"; return ;; esac
+		set -- "$@" --lpa "$LPA"
+	elif [ -n "$SMDP" ] && [ -n "$MATCHING_ID" ]; then
+		set -- "$@" --smdp "$SMDP" --matching-id "$MATCHING_ID"
+	else
+		send_error "Provide LPA code or SM-DP+ with matching ID"
+		return
+	fi
+	[ -n "$CONFIRMATION" ] && set -- "$@" --confirmation "$CONFIRMATION"
+	out=$("$BACKEND_SCRIPT" "$@" 2>>"$RUN_LOG")
+	[ -n "$out" ] && echo "$out" || send_error "No response from lpac-esim"
+}
+
+run_lpac_nickname() {
+	local iccid="$1"
+	local nickname="$2"
+
+	get_lpac_config
+	mkdir -p "$RUN_DIR"
+	set -- --api --backend "$APDU_BACKEND"
+	case "$APDU_BACKEND" in
+		mbim)
+			set -- "$@" --mbim-device "$MBIM_DEVICE"
+			[ "$MBIM_PROXY" = "1" ] && set -- "$@" --mbim-proxy
+			;;
+		*) set -- "$@" --device "$QMI_DEVICE" --slot "$QMI_SIM_SLOT" ;;
+	esac
+	[ -n "$AT_DEVICE" ] && set -- "$@" --at-device "$AT_DEVICE"
+	out=$("$BACKEND_SCRIPT" "$@" nickname "$iccid" --nickname "$nickname" 2>>"$RUN_LOG")
+	[ -n "$out" ] && echo "$out" || send_error "No response from lpac-esim"
+}
+
+send_config() {
+	get_lpac_config
+	cat <<JSON
+{"success":true,"config":{"apdu_backend":"$(json_escape "$APDU_BACKEND")","qmi_device":"$(json_escape "$QMI_DEVICE")","qmi_sim_slot":"$(json_escape "$QMI_SIM_SLOT")","sim_slot":"$(json_escape "$SIM_SLOT")","at_device":"$(json_escape "$AT_DEVICE")","mbim_device":"$(json_escape "$MBIM_DEVICE")","mbim_proxy":"$(json_escape "$MBIM_PROXY")","skip_slot_mapping":"$(json_escape "$SKIP_SLOT_MAPPING")","custom_isd_r_aid":"$(json_escape "$CUSTOM_ISD_R_AID")","reboot_method":"$(json_escape "$REBOOT_METHOD")","apdu_debug":"$(json_escape "$APDU_DEBUG")","http_debug":"$(json_escape "$HTTP_DEBUG")","at_debug":"$(json_escape "$AT_DEBUG")"}}
+JSON
+}
+
+save_config() {
+	read_input
+	json_get_var config config
+	[ -n "$config" ] || { send_error "No config payload"; return; }
+	json_load "$config" >/dev/null 2>&1 || { send_error "Invalid config JSON"; return; }
+
+	json_get_var apdu_backend apdu_backend
+	case "$apdu_backend" in qmi|at|mbim|'') ;; *) send_error "Invalid APDU backend"; return ;; esac
+	json_get_var qmi_sim_slot qmi_sim_slot
+	case "$qmi_sim_slot" in 1|2|'') ;; *) send_error "Invalid QMI slot"; return ;; esac
+	json_get_var sim_slot sim_slot
+	case "$sim_slot" in 0|1|'') ;; *) send_error "Invalid SIM slot"; return ;; esac
+	for key in qmi_device at_device mbim_device; do
+		json_get_var value "$key"
+		case "$value" in ''|/dev/*) ;; *) send_error "Invalid device path: $key"; return ;; esac
+	done
+
+	uci -q batch <<UCI
+set $UCI_LPAC.main=lpac-esim
+UCI
+	for key in apdu_backend qmi_device qmi_sim_slot sim_slot at_device mbim_device mbim_proxy skip_slot_mapping custom_isd_r_aid reboot_method apdu_debug http_debug at_debug; do
+		json_get_var value "$key"
+		[ -n "$value" ] || continue
+		case "$key" in mbim_proxy|skip_slot_mapping|apdu_debug|http_debug|at_debug) valid_flag "$value" || { send_error "Invalid flag: $key"; return; } ;; esac
+		uci -q set "$UCI_LPAC.main.$key=$value"
+	done
+	uci -q commit "$UCI_LPAC" && echo '{"success":true}' || send_error "Failed to commit UCI"
+}
+
+send_telegram_config() {
+	enabled="$(uci -q get "$UCI_TG.main.enabled" || echo 0)"
+	token="$(uci -q get "$UCI_TG.main.token" || echo '')"
+	chat_id="$(uci -q get "$UCI_TG.main.chat_id" || echo '')"
+	poll_interval="$(uci -q get "$UCI_TG.main.poll_interval" || echo 2)"
+	allow_disruptive="$(uci -q get "$UCI_TG.main.allow_disruptive" || echo 1)"
+	require_confirm="$(uci -q get "$UCI_TG.main.require_confirm" || echo 1)"
+	if [ -n "$token" ] && [ "${#token}" -gt 12 ]; then
+		token="$(printf '%s' "$token" | sed 's/^\(.\{8\}\).*\(.\{4\}\)$/\1...\2/')"
+	fi
+	cat <<JSON
+{"config":{"enabled":"$(json_escape "$enabled")","token":"$(json_escape "$token")","chat_id":"$(json_escape "$chat_id")","poll_interval":"$(json_escape "$poll_interval")","allow_disruptive":"$(json_escape "$allow_disruptive")","require_confirm":"$(json_escape "$require_confirm")"}}
+JSON
+}
+
+telegram_status() {
+	pid_file="/var/run/xmodem-esim-bot.pid"
+	running=false
+	pid=""
+	[ -f "$pid_file" ] && pid="$(cat "$pid_file" 2>/dev/null)"
+	[ -n "$pid" ] && [ -d "/proc/$pid" ] && running=true
+	if [ "$running" != "true" ] && pgrep -f '/usr/bin/xmodem-esim-bot' >/dev/null 2>&1; then
+		running=true
+		pid="$(pgrep -f '/usr/bin/xmodem-esim-bot' | head -n1)"
+	fi
+	if [ -f /tmp/lpac-esim/telegram.status ]; then
+		status="$(cat /tmp/lpac-esim/telegram.status)"
+		if [ "$running" = "true" ]; then
+			echo "$status" | sed 's/^{/{"running":true,/'
+		else
+			echo "$status" | sed 's/^{/{"running":false,/'
+		fi
+	else
+		echo "{\"running\":$running,\"state\":\"stopped\",\"pid\":\"$(json_escape "$pid")\"}"
+	fi
+}
+
+save_telegram_config() {
+	read_input
+	for key in enabled token chat_id poll_interval allow_disruptive require_confirm; do
+		json_get_var value "$key"
+		eval "TG_$key=\$value"
+	done
+	[ -z "$TG_enabled" ] && TG_enabled=0
+	if [ "$TG_enabled" = "1" ]; then
+		[ -n "$TG_token" ] || { send_error "Bot token is required"; return; }
+		[ -n "$TG_chat_id" ] || { send_error "Chat ID is required"; return; }
+	fi
+	uci -q set "$UCI_TG.main=bot"
+	uci -q set "$UCI_TG.main.enabled=$TG_enabled"
+	case "$TG_token" in
+		????????...*) ;;
+		*) [ -n "$TG_token" ] && uci -q set "$UCI_TG.main.token=$TG_token" ;;
+	esac
+	[ -n "$TG_chat_id" ] && uci -q set "$UCI_TG.main.chat_id=$TG_chat_id"
+	[ -n "$TG_poll_interval" ] && uci -q set "$UCI_TG.main.poll_interval=$TG_poll_interval"
+	[ -n "$TG_allow_disruptive" ] && uci -q set "$UCI_TG.main.allow_disruptive=$TG_allow_disruptive"
+	[ -n "$TG_require_confirm" ] && uci -q set "$UCI_TG.main.require_confirm=$TG_require_confirm"
+	uci -q commit "$UCI_TG" || { send_error "Failed to commit UCI"; return; }
+	/etc/init.d/xmodem_esim_bot restart >/dev/null 2>&1
+	echo '{"success":true}'
+}
+
+connectivity() {
+	ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo '{"success":true,"connected":true}' || echo '{"success":true,"connected":false}'
+}
+
+case "$1" in
+	list)
+		cat <<'JSON'
+{"chip":{},"profiles":{},"modem_status":{},"notif_list":{},"lock_status":{},"switch":{"iccid":"string"},"reboot_modem":{},"notif_clear":{},"download":{"lpa":"string","smdp":"string","matching_id":"string","confirmation":"string"},"delete":{"iccid":"string"},"nickname":{"iccid":"string","nickname":"string"},"notif_process":{},"version":{},"config":{},"save_config":{"config":"string"},"telegram_config":{},"telegram_status":{},"save_telegram_config":{"enabled":"string","token":"string","chat_id":"string","poll_interval":"string","allow_disruptive":"string","require_confirm":"string"},"test_telegram":{"token":"string","chat_id":"string"},"telegram_toggle":{"action":"string"},"connectivity":{}}
+JSON
+		;;
+	call)
+		case "$2" in
+			chip) run_lpac chip ;;
+			profiles) run_lpac profiles ;;
+			modem_status) run_lpac modem-status ;;
+			notif_list) run_lpac notif-list ;;
+			lock_status) run_lpac lock-status ;;
+			switch) read_input; json_get_var iccid iccid; valid_iccid "$iccid" || { send_error "Invalid ICCID"; exit 0; }; run_lpac switch "$iccid" ;;
+			reboot_modem) run_lpac reboot-modem ;;
+			notif_clear) run_lpac notif-clear ;;
+			download) read_input; json_get_var LPA lpa; json_get_var SMDP smdp; json_get_var MATCHING_ID matching_id; json_get_var CONFIRMATION confirmation; run_lpac_download ;;
+			delete) read_input; json_get_var iccid iccid; valid_iccid "$iccid" || { send_error "Invalid ICCID"; exit 0; }; run_lpac delete "$iccid" ;;
+			nickname) read_input; json_get_var iccid iccid; json_get_var nickname nickname; valid_iccid "$iccid" || { send_error "Invalid ICCID"; exit 0; }; [ -n "$nickname" ] || { send_error "Nickname required"; exit 0; }; [ "${#nickname}" -le 64 ] || { send_error "Nickname too long"; exit 0; }; run_lpac_nickname "$iccid" "$nickname" ;;
+			notif_process) run_lpac notif-process ;;
+			version) run_lpac version ;;
+			config) send_config ;;
+			save_config) save_config ;;
+			telegram_config) send_telegram_config ;;
+			telegram_status) telegram_status ;;
+			save_telegram_config) save_telegram_config ;;
+			test_telegram)
+				read_input
+				json_get_var token token
+				json_get_var chat_id chat_id
+				
+				[ -z "$token" ] && token="$(uci -q get "$UCI_TG.main.token")"
+				[ -z "$chat_id" ] && chat_id="$(uci -q get "$UCI_TG.main.chat_id")"
+				[ -z "$token" ] || [ -z "$chat_id" ] && { send_error "Token and Chat ID required"; exit 0; }
+				result=$(curl -s -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" -d "chat_id=${chat_id}" -d "text=✅ XModem eSIM Bot - connection test OK!" 2>/dev/null)
+				echo "$result" | grep -q '"ok":true' && echo '{"success":true}' || send_error "$(echo "$result" | sed 's/"/\\"/g')"
+				;;
+			telegram_toggle) read_input; json_get_var action action; [ "$action" = start ] && /etc/init.d/xmodem_esim_bot start >/dev/null 2>&1 || /etc/init.d/xmodem_esim_bot stop >/dev/null 2>&1; echo '{"success":true}' ;;
+			connectivity) connectivity ;;
+			*) send_error "Unknown method" ;;
+		esac
+		;;
+esac

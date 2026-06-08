@@ -36,6 +36,10 @@ define Package/$(PKG_NAME)/description
 	XModem scripts
 endef
 
+define Package/$(PKG_NAME)/conffiles
+/etc/config/xmodem
+endef
+
 define Build/Prepare
 endef
 

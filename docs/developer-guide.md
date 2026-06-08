@@ -7,39 +7,26 @@ This document provides a guide for developers looking to understand, extend, or 
 The `luci-app-xmodem` is the core LuCI application for modem management. Its structure follows the standard LuCI MVC pattern.
 
 ```
-luci-app-xmodem/
-├── Makefile              # Build instructions for the package
+luci-app-xmodem-next/
+├── Makefile              # Build instructions (uses luci.mk)
 ├── htdocs/
 │   └── luci-static/      # Static web assets (JS, CSS, images)
 │       └── resources/
-│           └── xmodem/
-│               ├── modem.js # Main JavaScript for frontend logic
-│               └── ...      # Other JS files
-├── luasrc/
-│   ├── controller/
-│   │   └── xmodem.lua    # Main controller, handles API requests and page rendering
-│   ├── model/
-│   │   └── cbi/
-│   │       └── xmodem/   # CBI models for configuration pages
-│   │           ├── dial_config.lua
-│   │           ├── modem_cfg.lua
-│   │           └── ...
-│   └── view/
-│       └── xmodem/       # HTML templates for the views
-│           ├── modem_status.htm
-│           └── ...
+│           ├── view/xmodem/  # Client-side JS views
+│           └── xmodem/       # Shared JS modules and CSS
+├── po/                   # Translation files
 └── root/
-    └── etc/
-        ├── config/
-        │   └── xmodem    # Default configuration file
-        └── uci-defaults/
-            └── luci-xmodem # Script to set up default configs
+    ├── etc/
+    │   └── xmodem/       # Runtime data directory
+    └── usr/share/
+        ├── luci/menu.d/  # Menu definition (JSON)
+        └── rpcd/acl.d/   # Access control (JSON)
 ```
 
--   **`controller/xmodem.lua`**: The heart of the application. It defines the menu structure and handles all the API calls from the frontend.
--   **`model/cbi/xmodem/`**: Contains the CBI (Configuration Binding Interface) files that generate the forms in the LuCI web interface for configuring the modem.
--   **`htdocs/luci-static/resources/xmodem/`**: Contains JavaScript files that provide dynamic functionality to the web interface, such as polling for modem status.
--   **`root/etc/config/xmodem`**: The UCI configuration file where all settings for the modem are stored.
+-   **`htdocs/luci-static/resources/view/xmodem/`**: Client-side JS views that render the UI.
+-   **`root/usr/share/luci/menu.d/`**: JSON menu definition.
+-   **`root/usr/share/rpcd/acl.d/`**: JSON ACL for rpcd access control.
+-   **`root/etc/config/xmodem`**:  The UCI configuration file where all settings for the modem are stored.
 
 ## 2. API Endpoints and Parameters
 

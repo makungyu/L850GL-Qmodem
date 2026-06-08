@@ -17,7 +17,6 @@ function loadTelegramConfig() {
                 var c = data.config;
                 document.getElementById('tg-enabled').checked = (c.enabled === '1');
                 document.getElementById('tg-token').value = c.token || '';
-                document.getElementById('tg-token').setAttribute('data-masked', c.token || '');
                 document.getElementById('tg-chat-id').value = c.chat_id || '';
                 document.getElementById('tg-poll-interval').value = c.poll_interval || '30';
                 document.getElementById('tg-allow-disruptive').checked = (c.allow_disruptive !== '0');
@@ -67,9 +66,7 @@ function checkBotStatus() {
 function saveTelegramConfig() {
     var tokenEl = document.getElementById('tg-token');
     var token = tokenEl.value.trim();
-    var maskedToken = tokenEl.getAttribute('data-masked') || '';
 
-    // If token hasn't changed from masked version, send masked (server will skip update)
     var config = {
         enabled: document.getElementById('tg-enabled').checked ? '1' : '0',
         token: token,
@@ -79,7 +76,7 @@ function saveTelegramConfig() {
         require_confirm: document.getElementById('tg-require-confirm').checked ? '1' : '0'
     };
 
-    if (config.enabled === '1' && (!config.token || config.token === maskedToken) && maskedToken === '') {
+    if (config.enabled === '1' && !config.token) {
         alert('Bot Token is required when bot is enabled.');
         return;
     }

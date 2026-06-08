@@ -17,7 +17,7 @@ echo "=============================================="
 # Ensure backend script is executable
 [ -f /usr/bin/lpac-esim ] && chmod 0755 /usr/bin/lpac-esim 2>/dev/null || true
 
-# Fix directory permissions (opkg/nfpm may strip them)
+# Fix directory permissions (opkg may strip them)
 chmod 755 /usr/share/luci/menu.d 2>/dev/null || true
 chmod 755 /usr/share/rpcd/acl.d 2>/dev/null || true
 

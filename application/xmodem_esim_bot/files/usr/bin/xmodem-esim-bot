@@ -1,1437 +1,550 @@
-#!/bin/sh
-# xmodem-esim-bot — Telegram bot for eSIM management on OpenWrt
-# POSIX shell (ash/busybox compatible), inspired by 0xygen-AIO bot UI
-# Requires: curl, jq, lpac-esim, esim_ctrl.sh
-#
-# Features:
-#   - Inline keyboard buttons with profile switch/delete
-#   - Main menu with persistent keyboard
-#   - Callback query handling (tap buttons → instant action)
-#   - Confirmation before disruptive operations
-#   - Settings menu with toggle buttons
-#   - EID info with emoji formatting
-#   - Download eSIM via LPA string
-#   - Process Notifications from button
-#   - Status file for LuCI real-time display
-#   - 64-bit chat ID handling (ARM 32-bit safe via string compare)
+#!/usr/bin/ucode
+'use strict';
+import * as fs from 'fs';
 
-APP_NAME="xmodem-esim-bot"
-APP_VER="2.0.0"
+const APP_NAME = "xmodem-esim-bot";
+const APP_VER = "3.2.0 (Ucode)";
+const STATE_DIR = "/tmp/lpac-esim";
+const OFFSET_FILE = `${STATE_DIR}/telegram.offset`;
+const STATUS_FILE = `${STATE_DIR}/telegram.status`;
+const PENDING_FILE = `${STATE_DIR}/telegram.pending`;
+const PID_FILE = "/var/run/xmodem-esim-bot.pid";
 
-###############################################################################
-# Configuration
-###############################################################################
+let config = {
+	enabled: false,
+	token: "",
+	chat_id: "",
+	poll_interval: 0,
+	allow_disruptive: true,
+	require_confirm: true,
+	debug: false
+};
+let tg_api = "";
+let last_update_id = 0;
 
-BOT_TOKEN=""
-CHAT_ID=""
-POLL_INTERVAL=2
-POLL_TIMEOUT=25
-ALLOW_DISRUPTIVE=1
-REQUIRE_CONFIRM=1
-ENABLED=0
-DEBUG=0
+function sys(cmd) { let f = fs.popen(cmd, "r"); if (!f) return ""; let out = f.read("all"); f.close(); return out || ""; }
+function sys_bg(cmd) { system(`${cmd} >/dev/null 2>&1 &`); }
+function sys_exec(cmd) { system(`${cmd} >/dev/null 2>&1`); }
+function trim(s) { return replace(replace(`${s || ""}`, /^\s+/, ""), /\s+$/, ""); }
+function sh_quote(s) { return "'" + replace(`${s || ""}`, "'", "'\\''") + "'"; }
+function html(s) { s = `${s || ""}`; s = replace(s, "&", "&amp;"); s = replace(s, "<", "&lt;"); s = replace(s, ">", "&gt;"); return s; }
+function is_lpa(s) { return match(`${s || ""}`, /^[Ll][Pp][Aa]:1\$/); }
+function safe_int(v, def) { let n = int(v); return n == null ? def : n; }
 
-# Runtime
-LAST_UPDATE_ID=0
-STATE_DIR="/tmp/lpac-esim"
-OFFSET_FILE="$STATE_DIR/telegram.offset"
-STATUS_FILE="$STATE_DIR/telegram.status"
-PENDING_FILE="$STATE_DIR/telegram.pending"
-PID_FILE="/var/run/$APP_NAME.pid"
+function log(msg) { sys_exec(`logger -t ${sh_quote(APP_NAME)} ${sh_quote(msg)}`); }
+function log_debug(msg) { if (config.debug) log(`[D] ${msg}`); }
+function ensure_state_dir() { sys_exec(`mkdir -p ${sh_quote(STATE_DIR)}`); }
+function current_pid() { return trim(sys(`pgrep -f '^/usr/bin/ucode /usr/bin/xmodem-esim-bot$' | head -n1`)) || trim(sys(`pgrep -f '/usr/bin/xmodem-esim-bot' | head -n1`)) || "0"; }
+function write_status(state, rc) {
+	ensure_state_dir();
+	let f = fs.open(STATUS_FILE, "w");
+	if (f) { f.write(sprintf('%J\n', {state: state, last_poll: time(), last_rc: rc || 0, pid: current_pid()})); f.close(); }
+}
+function load_offset() { let off = trim(fs.readfile(OFFSET_FILE)); if (off) last_update_id = safe_int(off, 0); }
+function save_offset() { ensure_state_dir(); let f = fs.open(OFFSET_FILE, "w"); if (f) { f.write(`${last_update_id}`); f.close(); } }
+function set_pending(action, arg) { ensure_state_dir(); let f = fs.open(PENDING_FILE, "w"); if (f) { f.write(sprintf("%J", {action: action, arg: arg || ""})); f.close(); } }
+function get_pending() { try { let raw = fs.readfile(PENDING_FILE); return raw ? json(raw) : null; } catch (e) { return null; } }
+function clear_pending() { sys_exec(`rm -f ${sh_quote(PENDING_FILE)}`); }
 
-###############################################################################
-# Logging & Helpers
-###############################################################################
-
-log_msg() { logger -t "$APP_NAME" "$1"; }
-log_debug() { [ "$DEBUG" = "1" ] && logger -t "$APP_NAME" "[D] $1"; }
-
-write_status() {
-    local state="$1" rc="$2"
-    mkdir -p "$STATE_DIR"
-    printf '{"state":"%s","last_poll":%d,"last_rc":%d,"pid":%d}\n' \
-        "$state" "$(date +%s)" "${rc:-0}" "$$" > "$STATUS_FILE"
+function uci_get(path, def) { let v = trim(sys(`uci -q get ${sh_quote(path)} 2>/dev/null`)); return v || def || ""; }
+function uci_set(path, value) { sys_exec(`uci -q set ${sh_quote(`${path}=${value}`)}`); }
+function load_config() {
+	let r = sys("ubus call uci get '{\"config\":\"xmodem_esim_bot\",\"section\":\"main\"}' 2>/dev/null");
+	let d = null; try { d = json(r); } catch (e) {}
+	if (!d || !d.values) return false;
+	let v = d.values;
+	let get = function(k, def) { return exists(v, k) ? v[k] : def; };
+	config.enabled = (get("enabled", "0") == "1");
+	config.token = get("token", "");
+	config.chat_id = `${get("chat_id", "")}`;
+	config.poll_interval = safe_int(get("poll_interval", "0"), 0);
+	config.allow_disruptive = (get("allow_disruptive", "1") == "1");
+	config.require_confirm = (get("require_confirm", "1") == "1");
+	config.debug = (get("debug", "0") == "1");
+	if (!config.token || !config.enabled) return false;
+	tg_api = `https://api.telegram.org/bot${config.token}`;
+	return true;
 }
 
-save_offset() { echo "$LAST_UPDATE_ID" > "$OFFSET_FILE"; }
-load_offset() { [ -f "$OFFSET_FILE" ] && LAST_UPDATE_ID=$(cat "$OFFSET_FILE"); }
+function lpac_api(method, args) {
+	let cmd = `ubus call lpac_esim ${method}`;
+	if (args) cmd += ` ${sh_quote(sprintf("%J", args))}`;
+	try {
+		let res = json(sys(`${cmd} 2>/dev/null`));
+		if (res && res.payload && exists(res.payload, "data")) return {success: (res.payload.code === 0), data: res.payload.data, msg: res.payload.message || ""};
+		return res || {success: false, error: "Empty response"};
+	} catch (e) { return {success: false, error: "Invalid JSON from ubus"}; }
+}
+function tg_post(method, payload) {
+	let t = `/tmp/xmodem-esim-bot-${time()}-${method}.json`;
+	let f = fs.open(t, "w");
+	if (!f) return null;
+	f.write(sprintf("%J", payload));
+	f.close();
+	let r = sys(`curl -s -m 20 -X POST -H "Content-Type: application/json" -d @${sh_quote(t)} ${sh_quote(`${tg_api}/${method}`)}`);
+	fs.unlink(t);
+	try { return json(r); } catch (e) { log_debug(`Telegram ${method} invalid response: ${r}`); return null; }
+}
+function tg_send(text, markup) { let p = {chat_id: config.chat_id, text: text, parse_mode: "HTML"}; if (markup) p.reply_markup = markup; return tg_post("sendMessage", p); }
+function tg_edit(id, text, markup) { if (!id) return tg_send(text, markup); let p = {chat_id: config.chat_id, message_id: id, text: text, parse_mode: "HTML"}; if (markup) p.reply_markup = markup; return tg_post("editMessageText", p); }
+function tg_answer(cb, text) { if (!cb) return null; let p = {callback_query_id: cb}; if (text) p.text = text; return tg_post("answerCallbackQuery", p); }
+function tg_send_retry(text, inline_keyboard) {
+	let markup = inline_keyboard ? {inline_keyboard: inline_keyboard} : null;
+	for (let i = 0; i < 18; i++) {
+		let r = tg_send(text, markup);
+		if (r && r.ok) return true;
+		sys_exec("sleep 5");
+	}
+	log("tg_send_retry failed after 18 attempts");
+	return false;
+}
+function update_ui(msg_id, text, markup) { let r = msg_id ? tg_edit(msg_id, text, markup) : tg_send(text, markup); return (r && r.ok && r.result && r.result.message_id) ? r.result.message_id : msg_id; }
 
-save_pending() {
-    local action="$1" arg="$2"
-    printf '%s\n%s\n' "$action" "$arg" > "$PENDING_FILE"
+const INLINE_MENU = [[{text: "🏠 Menu", callback_data: "menu:main"}]];
+function send_main_menu() {
+	clear_pending();
+	tg_send(`<b>XModem eSIM Bot v${APP_VER}</b>\n\nSelect a menu below or type a command.`, {
+		keyboard: [[{text: "📱 Info EID"}, {text: "📋 Profile List"}], [{text: "📥 Download eSIM"}, {text: "🔔 Notifications"}], [{text: "📡 Modem Status"}, {text: "⚙️ Settings"}], [{text: "❓ Help"}]],
+		resize_keyboard: true
+	});
+}
+function ui_help() {
+	tg_send(`📋 <b>XModem eSIM Bot v${APP_VER}</b>\n\n<b>Menu Buttons:</b>\n📱 Info EID — eUICC chip info, storage, EID\n📋 Profile List — switch/manage eSIM profiles\n📥 Download — download new eSIM profile\n🔔 Notifications — process pending notifications\n📡 Modem Status — signal, operator, band, temperature\n⚙️ Settings — toggle backend/proxy/debug\n\n<b>Commands:</b>\n/eid — Full eUICC chip information\n/profiles — Profile list with switch buttons\n/status — Modem status &amp; signal details\n/download &lt;LPA&gt; — Download new profile\n/enable &lt;ICCID&gt; — Switch profile\n/delete &lt;ICCID&gt; — Delete profile\n/notif — Process eSIM notifications\n/settings — lpac backend settings\n/chatid — Show your Chat ID\n/cancel — Cancel current operation`);
 }
 
-load_pending() {
-    [ -f "$PENDING_FILE" ] || return 1
-    PEND_ACTION=$(sed -n '1p' "$PENDING_FILE")
-    PEND_ARG=$(sed -n '2p' "$PENDING_FILE")
-    [ -n "$PEND_ACTION" ]
+function get_modem_section() { return trim(sys(`uci show xmodem 2>/dev/null | grep '=modem-device' | head -n1 | cut -d. -f2 | cut -d= -f1`)); }
+function modem_get(section, key, def) { return section ? uci_get(`xmodem.${section}.${key}`, def) : (def || ""); }
+function ubus_xmodem(method, section) { try { return json(sys(`ubus call xmodem ${method} ${sh_quote(sprintf("%J", {config_section: section}))} 2>/dev/null`)); } catch (e) { return null; } }
+function info_value(obj, keys, def) {
+	if (!obj) return def || "";
+	if (type(keys) != "array") keys = [keys];
+	for (let i = 0; i < length(keys); i++) if (exists(obj, keys[i]) && obj[keys[i]]) return obj[keys[i]];
+	let list = obj.modem_info || [];
+	for (let i = 0; i < length(list); i++) {
+		for (let j = 0; j < length(keys); j++) {
+			let k = `${keys[j]}`;
+			if (`${list[i].key || ""}` == k || `${list[i].full_name || ""}` == k) return `${list[i].value || ""}`;
+		}
+	}
+	return def || "";
+}
+function btn_label(s, max) { s = `${s || ""}`; max = max || 32; return length(s) > max ? `${substr(s, 0, max - 1)}…` : s; }
+function esim_ctrl_result(raw) {
+	let d = null; try { d = json(raw); } catch (e) {}
+	if (d && d.result) return {ok: `${d.result.status || ""}` == "1", error: d.result.error || d.result.message || raw};
+	if (d && exists(d, "success")) return {ok: d.success === true, error: d.error || d.message || raw};
+	return {ok: match(raw || "", /success/i), error: raw || "Unknown error"};
+}
+function find_profile(iccid) {
+	let r = lpac_api("profiles");
+	if (!r.success || !r.data) return null;
+	for (let i = 0; i < length(r.data); i++) if (`${r.data[i].iccid || ""}` == `${iccid || ""}`) return r.data[i];
+	return null;
+}
+function at_cmd(port, cmd) { if (!port) return ""; return trim(sys(`sms_tool_q -d ${sh_quote(port)} at ${sh_quote(cmd)} 2>/dev/null | tr -d '\r'`)); }
+function get_current_slot(section) {
+	let at_port = modem_get(section, "at_port", "");
+	let manufacturer = modem_get(section, "manufacturer", "");
+	let cur = "";
+	if (at_port) {
+		let r = "";
+		if (match(manufacturer, /[Ff]oxconn/)) {
+			r = at_cmd(at_port, "AT^SWITCH_SLOT?");
+			if (match(r, /SIM1/i)) cur = "0"; else if (match(r, /SIM2/i)) cur = "1";
+		} else if (match(manufacturer, /[Qq]uectel/)) {
+			r = at_cmd(at_port, "AT+QUIMSLOT?");
+			let m = match(r, /\+QUIMSLOT:\s*([0-9]+)/); if (m) cur = m[1];
+		}
+		if (!cur) {
+			r = at_cmd(at_port, "AT^SWITCH_SLOT?");
+			let m = match(r, /SWITCH_SLOT[^0-9]*([0-9]+)/i); if (m) cur = m[1];
+			if (!cur) { r = at_cmd(at_port, "AT+QUIMSLOT?"); m = match(r, /\+QUIMSLOT:\s*([0-9]+)/); if (m) cur = m[1]; }
+		}
+	}
+	return cur || modem_get(section, "sim_slot", "");
 }
 
-clear_pending() { rm -f "$PENDING_FILE"; }
-
-###############################################################################
-# UCI Config
-###############################################################################
-
-load_config() {
-    . /lib/functions.sh
-    config_load xmodem_esim_bot
-    config_get ENABLED main enabled "0"
-    config_get BOT_TOKEN main token ""
-    config_get CHAT_ID main chat_id ""
-    config_get POLL_INTERVAL main poll_interval "2"
-    config_get ALLOW_DISRUPTIVE main allow_disruptive "1"
-    config_get REQUIRE_CONFIRM main require_confirm "1"
-    config_get DEBUG main debug "0"
-
-    [ -z "$BOT_TOKEN" ] && { log_msg "ERROR: token not set"; return 1; }
-    [ "$ENABLED" != "1" ] && { log_msg "disabled"; return 1; }
-    return 0
+function ui_eid(msg_id) {
+	msg_id = update_ui(msg_id, "⏳ <b>Membaca eUICC...</b>");
+	let chip = lpac_api("chip");
+	let profiles = lpac_api("profiles");
+	if (!chip.success) return update_ui(msg_id, `❌ <b>Gagal membaca EID</b>\n${html(chip.error || chip.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+	let d = chip.data || {};
+	let info = d.EUICCInfo2 || {};
+	let res = info.extCardResource || {};
+	let addr = d.EuiccConfiguredAddresses || {};
+	let free_nv = res.freeNonVolatileMemory || "-";
+	let nv_display = `${free_nv} B`;
+	if (free_nv != "-" && safe_int(free_nv, 0) > 1024) nv_display = `${int(free_nv / 1024)} KB`;
+	let count = profiles.success && profiles.data ? length(profiles.data) : 0;
+	let section = get_modem_section();
+	let slot = get_current_slot(section);
+	let slot_text = slot ? `SIM Slot: ${slot}` : "SIM Switch";
+	let text = `📱 <b>eUICC / eSIM Chip Info</b>\n\n🔑 <b>EID:</b>\n<code>${html(d.eidValue || "-")}</code>\n\n📊 <b>Chip Info:</b>\n  • SVN: <code>${html(info.svn || "-")}</code>\n  • Firmware: <code>${html(info.euiccFirmwareVer || "-")}</code>\n  • SM-DP+: <code>${html(addr.defaultDpAddress || "Not set")}</code>\n  • SM-DS: <code>${html(addr.rootDsAddress || "-")}</code>\n\n💾 <b>Storage:</b>\n  • Free NV: ${html(nv_display)}\n  • Free RAM: ${html(res.freeVolatileMemory || "-")} B\n  • Apps: ${html(res.installedApplication || "0")}\n\n📂 <b>Profiles:</b> ${count} stored`;
+	update_ui(msg_id, text, {inline_keyboard: [[{text: "📋 Profiles", callback_data: "menu:profiles", style: "primary"}, {text: `🔄 ${slot_text}`, callback_data: "menu:simswitch", style: "primary"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
 }
 
-###############################################################################
-# Telegram API (64-bit safe: chat_id as string, never arithmetic)
-###############################################################################
-
-TG_API=""
-
-tg_post() {
-    local method="$1" payload="$2"
-    curl -s -m 20 -X POST \
-        -H "Content-Type: application/json" \
-        -d "$payload" \
-        "${TG_API}/${method}" 2>/dev/null
+function profile_name(p) { return p.profileNickname || p.profileName || p.serviceProviderName || "Unknown"; }
+function profile_active(p) { return p.profileState == "enabled" || p.state == "enabled"; }
+function ui_profiles(msg_id) {
+	msg_id = update_ui(msg_id, "⏳ <b>Membaca profile...</b>");
+	let res = lpac_api("profiles");
+	if (!res.success) return update_ui(msg_id, `❌ <b>Gagal membaca profiles</b>\n${html(res.error || res.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+	let p = res.data || [];
+	if (length(p) == 0) return update_ui(msg_id, "📋 No profiles.", {inline_keyboard: [[{text: "📥 Download eSIM", callback_data: "menu:download", style: "success"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
+	let text = `📋 <b>eSIM Profiles</b> (${length(p)})\n\n`;
+	let active_rows = [], inactive_buttons = [];
+	for (let i = 0; i < length(p); i++) {
+		let n = profile_name(p[i]);
+		let iccid = `${p[i].iccid || ""}`;
+		let active = profile_active(p[i]);
+		text += `${active ? "✅" : "▫️"} <b>${html(n)}</b>\nICCID: <code>${html(iccid)}</code>\nProvider: ${html(p[i].serviceProviderName || "-")}\nStatus: ${active ? "<b>ACTIVE</b>" : "Inactive"}\n\n`;
+		if (active) active_rows[length(active_rows)] = [{text: `🔒 ${btn_label(n)}`, callback_data: "noop", style: "primary"}];
+		else inactive_buttons[length(inactive_buttons)] = {text: `⚡ ${btn_label(n)}`, callback_data: `sw:${iccid}`, style: "danger"};
+	}
+	let kb = [];
+	for (let i = 0; i < length(active_rows); i++) kb[length(kb)] = active_rows[i];
+	for (let i = 0; i < length(inactive_buttons); i += 2) {
+		let row = [inactive_buttons[i]];
+		if (inactive_buttons[i + 1]) row[1] = inactive_buttons[i + 1];
+		kb[length(kb)] = row;
+	}
+	kb[length(kb)] = [{text: "⚡ Manage Profile", callback_data: "menu:manage", style: "primary"}];
+	kb[length(kb)] = [{text: "📥 Download eSIM", callback_data: "menu:download", style: "success"}];
+	kb[length(kb)] = [{text: "🔔 Notif", callback_data: "act:notifprocess"}, {text: "🏠 Menu", callback_data: "menu:main"}];
+	update_ui(msg_id, text, {inline_keyboard: kb});
 }
 
-# Send message with optional inline keyboard or reply keyboard
-tg_send() {
-    local text="$1" markup="$2"
-    local payload
-    payload=$(jq -nc --arg c "$CHAT_ID" --arg t "$text" \
-        '{chat_id:$c, text:$t, parse_mode:"HTML"}')
-    [ -n "$markup" ] && payload=$(echo "$payload" | jq --argjson m "$markup" '. + {reply_markup:$m}')
-    tg_post "sendMessage" "$payload" >/dev/null
+function ui_manage(msg_id) {
+	msg_id = update_ui(msg_id, "⏳ <b>Memuat manage profile...</b>");
+	let res = lpac_api("profiles");
+	if (!res.success) return update_ui(msg_id, `❌ <b>Gagal</b>\n${html(res.error || res.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+	let p = res.data || [], kb = [], del_buttons = [];
+	let text = "⚡ <b>Manage Profile</b>\n\nPilih profile nonaktif untuk delete. Profile aktif sengaja dikunci agar tidak terhapus.\n\n";
+	for (let i = 0; i < length(p); i++) {
+		let n = profile_name(p[i]), iccid = `${p[i].iccid || ""}`;
+		if (profile_active(p[i])) {
+			text += `🔒 <b>${html(n)}</b> (active)\n`;
+			kb[length(kb)] = [{text: `🔒 ${btn_label(n)}`, callback_data: "noop", style: "primary"}];
+		} else {
+			text += `🗑 ${html(n)}\n`;
+			del_buttons[length(del_buttons)] = {text: `🗑 ${btn_label(n)}`, callback_data: `del:${iccid}`, style: "danger"};
+		}
+	}
+	for (let i = 0; i < length(del_buttons); i += 2) {
+		let row = [del_buttons[i]];
+		if (del_buttons[i + 1]) row[1] = del_buttons[i + 1];
+		kb[length(kb)] = row;
+	}
+	kb[length(kb)] = [{text: "✏️ Rename Profile", callback_data: "menu:rename", style: "primary"}];
+	kb[length(kb)] = [{text: "📋 Profiles", callback_data: "menu:profiles"}, {text: "🏠 Menu", callback_data: "menu:main"}];
+	update_ui(msg_id, text, {inline_keyboard: kb});
 }
 
-# Send with inline keyboard JSON string
-tg_send_inline() {
-    local text="$1" kb_json="$2"
-    local payload
-    payload=$(jq -nc --arg c "$CHAT_ID" --arg t "$text" --argjson kb "$kb_json" \
-        '{chat_id:$c, text:$t, parse_mode:"HTML", reply_markup:{inline_keyboard:$kb}}')
-    tg_post "sendMessage" "$payload" >/dev/null
+function ui_rename_menu(msg_id) {
+	msg_id = update_ui(msg_id, "⏳ <b>Memuat rename menu...</b>");
+	let res = lpac_api("profiles");
+	if (!res.success) return update_ui(msg_id, `❌ <b>Gagal</b>\n${html(res.error || res.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+	let p = res.data || [], kb = [], buttons = [];
+	for (let i = 0; i < length(p); i++) buttons[length(buttons)] = {text: `✏️ ${btn_label(profile_name(p[i]))}`, callback_data: `ren:${p[i].iccid}`, style: "primary"};
+	for (let i = 0; i < length(buttons); i += 2) {
+		let row = [buttons[i]];
+		if (buttons[i + 1]) row[1] = buttons[i + 1];
+		kb[length(kb)] = row;
+	}
+	kb[length(kb)] = [{text: "⚡ Manage", callback_data: "menu:manage"}, {text: "🏠 Menu", callback_data: "menu:main"}];
+	update_ui(msg_id, "✏️ <b>Rename Profile</b>\n\nSelect profile to rename:", {inline_keyboard: kb});
 }
 
-# Send with persistent reply keyboard
-tg_send_keyboard() {
-    local text="$1" kb_json="$2"
-    local payload
-    payload=$(jq -nc --arg c "$CHAT_ID" --arg t "$text" --argjson kb "$kb_json" \
-        '{chat_id:$c, text:$t, parse_mode:"HTML", reply_markup:{keyboard:$kb, resize_keyboard:true}}')
-    tg_post "sendMessage" "$payload" >/dev/null
+function ui_download_prompt(msg_id) {
+	clear_pending(); set_pending("download", "");
+	update_ui(msg_id, "📥 <b>Download eSIM</b>\n\nKirim LPA string dengan format:\n<code>LPA:1$server$matchingId</code>\n\nKirim /cancel untuk batal.", {inline_keyboard: [[{text: "❌ Cancel", callback_data: "cancel", style: "danger"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
 }
 
-tg_answer_cb() {
-    local cb_id="$1" text="$2"
-    tg_post "answerCallbackQuery" \
-        "$(jq -nc --arg id "$cb_id" --arg t "$text" '{callback_query_id:$id, text:$t}')" >/dev/null
+function ui_notif(msg_id) {
+	msg_id = update_ui(msg_id, "⏳ <b>Membaca notifikasi...</b>");
+	let r = lpac_api("notif_list");
+	if (!r.success) return update_ui(msg_id, "❌ Failed to read notifications.", {inline_keyboard: INLINE_MENU});
+	let list = r.data || [];
+	if (length(list) == 0) return update_ui(msg_id, "🔔 <b>Notifications</b>\n\nNo pending eUICC notifications.", {inline_keyboard: INLINE_MENU});
+	update_ui(msg_id, `🔔 <b>Notifications</b>\n\nPending: <b>${length(list)}</b> messages.`, {inline_keyboard: [[{text: "⚡ Process All", callback_data: "act:notifprocess"}, {text: "🏠 Menu", callback_data: "menu:main"}]]});
 }
 
-# Edit an existing message (update in-place)
-tg_edit_msg() {
-    local msg_id="$1" text="$2" kb_json="$3"
-    local payload
-    payload=$(jq -nc --arg c "$CHAT_ID" --arg mid "$msg_id" --arg t "$text" \
-        '{chat_id:$c, message_id:($mid|tonumber), text:$t, parse_mode:"HTML"}')
-    [ -n "$kb_json" ] && payload=$(echo "$payload" | jq --argjson kb "$kb_json" \
-        '. + {reply_markup:{inline_keyboard:$kb}}')
-    tg_post "editMessageText" "$payload" >/dev/null
+function signal_bar(percent) { percent = safe_int(percent, 0); if (percent >= 80) return "▰▰▰▰▰"; if (percent >= 60) return "▰▰▰▰▱"; if (percent >= 40) return "▰▰▰▱▱"; if (percent >= 20) return "▰▰▱▱▱"; if (percent > 0) return "▰▱▱▱▱"; return "▱▱▱▱▱"; }
+function reg_text(cereg) {
+	let m = match(cereg || "", /\+CEREG:\s*[0-9]+,\s*([0-9]+)/);
+	if (!m) return cereg || "-";
+	let v = `${m[1]}`;
+	if (v == "1") return "Registered (home)";
+	if (v == "5") return "Registered (roaming)";
+	if (v == "2") return "Searching";
+	if (v == "3") return "Denied";
+	if (v == "0") return "Not registered";
+	return `State ${v}`;
+}
+function parse_debug(debug) {
+	let out = {rsrp: "-", rsrq: "-", rssi: "-", sinr: "-", band: "-", nr_band: "-", pci: "-", earfcn: "-"};
+	if (!debug) return out;
+	let m;
+	m = match(debug, /RSRP[^-0-9]*(-?[0-9]+)/i); if (m) out.rsrp = `${m[1]} dBm`;
+	m = match(debug, /RSRQ[^-0-9]*(-?[0-9]+)/i); if (m) out.rsrq = `${m[1]} dB`;
+	m = match(debug, /RSSI[^-0-9]*(-?[0-9]+)/i); if (m) out.rssi = `${m[1]} dBm`;
+	m = match(debug, /SINR[^-0-9]*(-?[0-9]+)/i); if (m) out.sinr = `${m[1]} dB`;
+	m = match(debug, /LTE\s*Band[^0-9]*([Bb]?[0-9]+)/i); if (!m) m = match(debug, /Band[^0-9]*([Bb]?[0-9]+)/i); if (m) out.band = `${m[1]}`;
+	m = match(debug, /NR[^0-9]*Band[^0-9]*([Nn]?[0-9]+)/i); if (m) out.nr_band = `${m[1]}`;
+	m = match(debug, /PCI[^0-9]*([0-9]+)/i); if (m) out.pci = `${m[1]}`;
+	m = match(debug, /EARFCN[^0-9]*([0-9]+)/i); if (m) out.earfcn = `${m[1]}`;
+	return out;
+}
+function ui_modem(msg_id) {
+	update_ui(msg_id, "📡 <b>Modem Status</b>\n\nFitur ini dinonaktifkan sementara karena query modem berat bisa membuat bot mengirim loading berulang.\n\nGunakan LuCI XModem untuk melihat status modem sampai parser Telegram dibuat ulang dengan aman.", {inline_keyboard: INLINE_MENU});
 }
 
-###############################################################################
-# Backend Calls (lpac-esim --api)
-###############################################################################
-
-lpac_api() { /usr/bin/lpac-esim --api "$@" 2>/dev/null; }
-
-get_modem_section() {
-    uci show xmodem 2>/dev/null | grep "=modem-device" | head -1 | cut -d. -f2 | cut -d= -f1
+function ui_settings(msg_id) {
+	let backend = uci_get("lpac-esim.main.apdu_backend", "mbim");
+	let proxy = uci_get("lpac-esim.main.mbim_proxy", "1");
+	let skip = uci_get("lpac-esim.main.skip_slot_mapping", "1");
+	let apdu_debug = uci_get("lpac-esim.main.apdu_debug", "0");
+	let text = `⚙️ <b>lpac Backend Settings</b>\n\nBackend aktif: <b>${html(backend)}</b>\nMBIM Proxy: <b>${proxy == "1" ? "ON" : "OFF"}</b>\nSkip Slot Mapping: <b>${skip == "1" ? "ON" : "OFF"}</b>\nAPDU Debug: <b>${apdu_debug == "1" ? "ON" : "OFF"}</b>`;
+	update_ui(msg_id, text, {inline_keyboard: [
+		[{text: `${backend == "qmi" ? "✅" : "▫️"} Backend QMI`, callback_data: "cfg:backend:qmi", style: backend == "qmi" ? "primary" : "danger"}, {text: `${backend == "mbim" ? "✅" : "▫️"} Backend MBIM`, callback_data: "cfg:backend:mbim", style: backend == "mbim" ? "primary" : "danger"}],
+		[{text: `${backend == "at" ? "✅" : "▫️"} Backend AT`, callback_data: "cfg:backend:at", style: backend == "at" ? "primary" : "danger"}],
+		[{text: `${proxy == "1" ? "✅" : "▫️"} MBIM Proxy`, callback_data: "cfg:toggle:mbim_proxy"}, {text: `${skip == "1" ? "✅" : "▫️"} Skip Slot`, callback_data: "cfg:toggle:skip_slot_mapping"}],
+		[{text: `${apdu_debug == "1" ? "✅" : "▫️"} APDU Debug`, callback_data: "cfg:toggle:apdu_debug"}],
+		[{text: "🏠 Menu", callback_data: "menu:main"}]
+	]});
 }
 
-# Send message with retry (for after internet-disrupting operations)
-# Keeps trying every 5s for up to 90s until Telegram API responds
-tg_send_retry() {
-    local text="$1" kb_json="$2"
-    local attempt=0 max_attempts=18  # 18 × 5s = 90s
-    while [ $attempt -lt $max_attempts ]; do
-        local payload
-        if [ -n "$kb_json" ]; then
-            payload=$(jq -nc --arg c "$CHAT_ID" --arg t "$text" --argjson kb "$kb_json" \
-                '{chat_id:$c, text:$t, parse_mode:"HTML", reply_markup:{inline_keyboard:$kb}}')
-        else
-            payload=$(jq -nc --arg c "$CHAT_ID" --arg t "$text" \
-                '{chat_id:$c, text:$t, parse_mode:"HTML"}')
-        fi
-        local resp
-        resp=$(tg_post "sendMessage" "$payload")
-        if echo "$resp" | grep -q '"ok":true'; then
-            return 0
-        fi
-        attempt=$((attempt + 1))
-        sleep 5
-    done
-    # Final attempt logged
-    log_msg "tg_send_retry failed after ${max_attempts} attempts"
-    return 1
+function ui_sim_switch(msg_id) {
+	let section = get_modem_section();
+	if (!section) return update_ui(msg_id, "❌ <b>SIM Switch</b>\nModem section tidak ditemukan.", {inline_keyboard: INLINE_MENU});
+	let manufacturer = modem_get(section, "manufacturer", "");
+	let slot = get_current_slot(section);
+	let text = `🔄 <b>SIM Switch</b>\n\nModem: <code>${html(section)}</code>\nManufacturer: ${html(manufacturer || "-")}\nCurrent slot: <b>${html(slot || "unknown")}</b>\n\nPilih slot tujuan:`;
+	let kb;
+	if (match(manufacturer, /[Ff]oxconn/)) kb = [[{text: `${slot == "0" ? "✅" : "▫️"} SIM Card`, callback_data: "simslot:0", style: slot == "0" ? "success" : "primary"}, {text: `${slot == "1" ? "✅" : "▫️"} eSIM`, callback_data: "simslot:1", style: slot == "1" ? "success" : "primary"}], [{text: "📱 EID Info", callback_data: "menu:eid"}, {text: "🏠 Menu", callback_data: "menu:main"}]];
+	else kb = [[{text: `${slot == "1" ? "✅" : "▫️"} Slot 1`, callback_data: "simslot:1", style: slot == "1" ? "success" : "primary"}, {text: `${slot == "2" ? "✅" : "▫️"} Slot 2`, callback_data: "simslot:2", style: slot == "2" ? "success" : "primary"}], [{text: "📱 EID Info", callback_data: "menu:eid"}, {text: "🏠 Menu", callback_data: "menu:main"}]];
+	update_ui(msg_id, text, {inline_keyboard: kb});
 }
 
-###############################################################################
-# UI: Main Menu (persistent keyboard buttons)
-###############################################################################
-
-send_main_menu() {
-    local kb='[
-        [{"text":"📱 Info EID"},{"text":"📋 Profile List"}],
-        [{"text":"📥 Download eSIM"},{"text":"🔔 Notifications"}],
-        [{"text":"📡 Modem Status"},{"text":"⚙️ Settings"}],
-        [{"text":"❓ Help"}]
-    ]'
-    tg_send_keyboard "<b>XModem eSIM Bot v${APP_VER}</b>
-
-Select a menu below or type a command." "$kb"
+function poll_lock_result(timeout) {
+	let elapsed = 0;
+	while (elapsed < timeout) {
+		sys_exec("sleep 3"); elapsed += 3;
+		let s = lpac_api("lock_status");
+		if (s && s.data && s.data.locked === false) return s.data.last_result || {};
+	}
+	return null;
+}
+function do_switch(iccid) {
+	if (!config.allow_disruptive) return tg_send("⛔ Operasi switch dinonaktifkan.");
+	let section = get_modem_section();
+	if (!section) return tg_send("❌ Modem section tidak ditemukan.");
+	let payload = sprintf("%J", {iccid: iccid, refresh: "1"});
+	tg_send(`⏳ <b>Switching Profile...</b>\nICCID: <code>${html(iccid)}</code>\n\nInternet mungkin putus sebentar.`);
+	let r = sys(`/usr/share/xmodem/esim_ctrl.sh profile_enable ${sh_quote(section)} ${sh_quote(payload)} 2>/dev/null`);
+	let parsed = esim_ctrl_result(r);
+	let kb = [[{text: "📋 Profiles", callback_data: "menu:profiles"}, {text: "🏠 Menu", callback_data: "menu:main"}]];
+	if (parsed.ok) tg_send_retry(`✅ <b>Profile Switched</b>\nICCID: <code>${html(iccid)}</code>`, kb);
+	else tg_send_retry(`❌ <b>Switch Failed</b>\nICCID: <code>${html(iccid)}</code>\n${html(parsed.error || "Unknown error")}`, kb);
+}
+function do_delete(iccid) {
+	if (!config.allow_disruptive) return tg_send("⛔ Operasi delete dinonaktifkan.");
+	let prof = find_profile(iccid);
+	if (prof && profile_active(prof)) return tg_send(`🔒 <b>Delete diblokir</b>\nProfile aktif tidak boleh dihapus.\nICCID: <code>${html(iccid)}</code>`, {inline_keyboard: [[{text: "📋 Profiles", callback_data: "menu:profiles"}]]});
+	let section = get_modem_section();
+	if (!section) return tg_send("❌ Modem section tidak ditemukan.");
+	let payload = sprintf("%J", {iccid: iccid});
+	tg_send(`⏳ <b>Deleting Profile...</b>\nICCID: <code>${html(iccid)}</code>`);
+	let r = sys(`/usr/share/xmodem/esim_ctrl.sh profile_delete ${sh_quote(section)} ${sh_quote(payload)} 2>/dev/null`);
+	let parsed = esim_ctrl_result(r);
+	if (parsed.ok) tg_send(`✅ <b>Profile Deleted</b>\nICCID: <code>${html(iccid)}</code>`, {inline_keyboard: [[{text: "📋 Profiles", callback_data: "menu:profiles"}]]});
+	else tg_send(`❌ <b>Delete Failed</b>\n${html(parsed.error || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+}
+function do_download(lpa) {
+	tg_send("⏳ <b>Downloading eSIM...</b>\n<i>Mohon tunggu.</i>");
+	let first = lpac_api("download", {lpa: lpa});
+	if (!first.success && !match(first.msg || first.error || "", /process|busy|lock|background/i)) {
+		let err = first.error || first.msg || "Download rejected by backend";
+		return tg_send(`❌ <b>Download Gagal</b>\n${html(err)}`, {inline_keyboard: [[{text: "📥 Retry", callback_data: "menu:download"}, {text: "🏠 Menu", callback_data: "menu:main"}]]});
+	}
+	let r = poll_lock_result(180);
+	let kb = [[{text: "📋 Profiles", callback_data: "menu:profiles"}, {text: "🏠 Menu", callback_data: "menu:main"}]];
+	if (!r) {
+		let err = trim(sys(`logread | grep -iE 'lpac|download|esim' | tail -n5`));
+		if (match(err, /fail|error|denied/i)) return tg_send(`❌ <b>Download Gagal</b>\n${html(err)}`, {inline_keyboard: kb});
+		return tg_send(`⚠️ <b>Download Timeout</b>\n${html(err || "Masih diproses di latar.")}`, {inline_keyboard: kb});
+	}
+	if (r.success || r.message == "success") tg_send("✅ <b>Download Berhasil</b>", {inline_keyboard: kb});
+	else tg_send(`❌ <b>Download Gagal</b>\n${html(r.error || r.message || "Unknown error")}`, {inline_keyboard: kb});
+}
+function do_notif_process() {
+	tg_send("⏳ <b>Processing Notifications...</b>");
+	let r = lpac_api("notif_process");
+	if (r.success || r.message == "success" || r.msg == "success") return tg_send("✅ <b>Notifications Processed</b>", {inline_keyboard: INLINE_MENU});
+	let locked = poll_lock_result(120);
+	if (!locked) return tg_send(`❌ <b>Notification Failed</b>\n${html(r.error || r.msg || "No backend result")}`, {inline_keyboard: INLINE_MENU});
+	if (locked.success || locked.message == "success") tg_send("✅ <b>Notifications Processed</b>", {inline_keyboard: INLINE_MENU});
+	else tg_send(`❌ <b>Notification Failed</b>\n${html(locked.error || locked.message || r.error || r.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+}
+function do_simslot(slot) {
+	if (!config.allow_disruptive) return tg_send("⛔ SIM switch dinonaktifkan.");
+	let section = get_modem_section();
+	if (!section) return tg_send("❌ Modem section tidak ditemukan.");
+	let at_port = modem_get(section, "at_port", "");
+	let manufacturer = modem_get(section, "manufacturer", "");
+	if (!at_port) return tg_send("❌ AT port modem tidak ditemukan.", {inline_keyboard: INLINE_MENU});
+	if (system(`test -e ${sh_quote(at_port)}`) != 0) return tg_send(`❌ AT port tidak tersedia: <code>${html(at_port)}</code>`, {inline_keyboard: INLINE_MENU});
+	if (system("test -x /usr/bin/sms_tool_q") != 0) return tg_send("❌ <code>/usr/bin/sms_tool_q</code> tidak tersedia atau tidak executable.", {inline_keyboard: INLINE_MENU});
+	tg_send(`⏳ <b>Switching SIM Slot...</b>\nTarget slot: <b>${html(slot)}</b>\n\nInternet mungkin putus sebentar.`);
+	let r = "";
+	if (match(manufacturer, /[Ff]oxconn/)) r = at_cmd(at_port, `AT^SWITCH_SLOT=${slot}`);
+	else if (match(manufacturer, /[Qq]uectel/)) r = at_cmd(at_port, `AT+QUIMSLOT=${slot}`);
+	else {
+		r = at_cmd(at_port, `AT^SWITCH_SLOT=${slot}`);
+		if (!match(r, /OK|SWITCH|SIM/i)) r = at_cmd(at_port, `AT+QUIMSLOT=${slot}`);
+	}
+	sys_exec("sleep 8");
+	let actual = get_current_slot(section);
+	if (actual == slot) {
+		uci_set(`xmodem.${section}.sim_slot`, slot); sys_exec("uci -q commit xmodem");
+		tg_send_retry(`✅ <b>SIM Slot Switched</b>\nCurrent slot: <b>${html(actual)}</b>`, [[{text: "🔄 SIM Switch", callback_data: "menu:simswitch"}, {text: "🏠 Menu", callback_data: "menu:main"}]]);
+	} else if (!actual && match(r, /OK/i)) {
+		uci_set(`xmodem.${section}.sim_slot`, slot); sys_exec("uci -q commit xmodem");
+		tg_send_retry(`⚠️ <b>SIM command sent</b>\nTarget slot: <b>${html(slot)}</b>\nSlot aktual tidak bisa diverifikasi, UCI sudah diupdate.`, [[{text: "🔄 SIM Switch", callback_data: "menu:simswitch"}, {text: "🏠 Menu", callback_data: "menu:main"}]]);
+	} else {
+		tg_send_retry(`❌ <b>SIM Slot Switch Failed</b>\nTarget: ${html(slot)}\nCurrent: ${html(actual || "unknown")}\nResponse: ${html(r || "-")}`, [[{text: "🔄 SIM Switch", callback_data: "menu:simswitch"}, {text: "🏠 Menu", callback_data: "menu:main"}]]);
+	}
+}
+function do_rename(iccid, name) {
+	let r = lpac_api("nickname", {iccid: iccid, nickname: name});
+	if (r.success || r.message == "success") tg_send(`✅ <b>Rename Berhasil</b>\nICCID: <code>${html(iccid)}</code>\nNama: <b>${html(name)}</b>`, {inline_keyboard: [[{text: "📋 Profiles", callback_data: "menu:profiles"}]]});
+	else tg_send(`❌ <b>Rename Gagal</b>\n${html(r.error || r.msg || "Unknown error")}`, {inline_keyboard: [[{text: "✏️ Retry", callback_data: "menu:rename"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
 }
 
-###############################################################################
-# UI: EID Info (full details + SIM Switch button)
-###############################################################################
-
-send_eid_info() {
-    local chip_raw prof_raw
-    chip_raw=$(lpac_api chip)
-    prof_raw=$(lpac_api profiles)
-
-    local eid svn fw free_nv free_v apps smdp smds prof_count
-    eid=$(echo "$chip_raw" | jq -r '.payload.data.eidValue // "-"')
-    svn=$(echo "$chip_raw" | jq -r '.payload.data.EUICCInfo2.svn // "-"')
-    fw=$(echo "$chip_raw" | jq -r '.payload.data.EUICCInfo2.euiccFirmwareVer // "-"')
-    free_nv=$(echo "$chip_raw" | jq -r '.payload.data.EUICCInfo2.extCardResource.freeNonVolatileMemory // "-"')
-    free_v=$(echo "$chip_raw" | jq -r '.payload.data.EUICCInfo2.extCardResource.freeVolatileMemory // "-"')
-    apps=$(echo "$chip_raw" | jq -r '.payload.data.EUICCInfo2.extCardResource.installedApplication // "0"')
-    smdp=$(echo "$chip_raw" | jq -r '.payload.data.EuiccConfiguredAddresses.defaultDpAddress // "Not set"')
-    smds=$(echo "$chip_raw" | jq -r '.payload.data.EuiccConfiguredAddresses.rootDsAddress // "-"')
-    prof_count=$(echo "$prof_raw" | jq -r '.payload.data | length // 0' 2>/dev/null)
-    [ -z "$prof_count" ] && prof_count=0
-
-    local nv_display="$free_nv B"
-    [ "$free_nv" != "-" ] && [ "$free_nv" -gt 1024 ] 2>/dev/null && nv_display="$((free_nv / 1024)) KB"
-
-    local text="📱 <b>eUICC / eSIM Chip Info</b>
-
-🔑 <b>EID:</b>
-<code>$eid</code>
-
-📊 <b>Chip Info:</b>
-  • SVN: <code>$svn</code>
-  • Firmware: <code>$fw</code>
-  • SM-DP+: <code>$smdp</code>
-  • SM-DS: <code>$smds</code>
-
-💾 <b>Storage:</b>
-  • Free NV: $nv_display
-  • Free RAM: $free_v B
-  • Apps: $apps
-
-📂 <b>Profiles:</b> $prof_count stored"
-
-    # Get current SIM slot info for SIM Switch button
-    local sim_slot_text="SIM Switch"
-    local modem_sec=$(get_modem_section)
-    if [ -n "$modem_sec" ]; then
-        local cur_slot=$(uci -q get "xmodem.${modem_sec}.sim_slot" 2>/dev/null)
-        [ -n "$cur_slot" ] && sim_slot_text="SIM Slot: $cur_slot"
-    fi
-
-    tg_send_inline "$text" \
-        "[[{\"text\":\"📋 Profiles\",\"callback_data\":\"menu:profiles\",\"style\":\"primary\"},{\"text\":\"🔄 $sim_slot_text\",\"callback_data\":\"menu:simswitch\",\"style\":\"primary\"}],[{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]]"
+function require_confirm(action, arg, text, yes_text) {
+	if (!config.require_confirm && action != "download" && action != "simslot") {
+		if (action == "switch") return do_switch(arg);
+		if (action == "delete") return do_delete(arg);
+	}
+	set_pending(action, arg);
+	tg_send(text, {inline_keyboard: [[{text: yes_text || "✅ Ya", callback_data: "confirm:yes", style: "success"}, {text: "❌ Cancel", callback_data: "cancel", style: "danger"}]]});
+}
+function handle_callback(cb, data, chat_id, msg_id) {
+	chat_id = `${chat_id || ""}`; data = `${data || ""}`;
+	if (chat_id != config.chat_id) { log(`Blocked callback chat: ${chat_id} vs config: ${config.chat_id}`); return; }
+	log_debug(`Callback ID: ${cb}, Data: ${data}, from: ${chat_id}`);
+	if (data == "noop") { tg_answer(cb, "Active profile"); return; }
+	tg_answer(cb, "Processing...");
+	let p = split(data, ":"); let c = p[0] || "", s = p[1] || "", a = p[2] || "";
+	if (data == "cancel") { clear_pending(); update_ui(msg_id, "❌ Dibatalkan.", {inline_keyboard: INLINE_MENU}); return; }
+	if (data == "confirm:yes") {
+		let pend = get_pending(); clear_pending();
+		if (!pend || !pend.action) return update_ui(msg_id, "⚠️ Tidak ada operasi pending.", {inline_keyboard: INLINE_MENU});
+		if (pend.action == "switch") return do_switch(pend.arg);
+		if (pend.action == "delete") return do_delete(pend.arg);
+		if (pend.action == "download") return do_download(pend.arg);
+		if (pend.action == "simslot") return do_simslot(pend.arg);
+		return update_ui(msg_id, "⚠️ Pending action tidak dikenal.", {inline_keyboard: INLINE_MENU});
+	}
+	if (c == "menu") {
+		if (s == "main") return send_main_menu();
+		if (s == "profiles") return ui_profiles(msg_id);
+		if (s == "manage") return ui_manage(msg_id);
+		if (s == "rename") return ui_rename_menu(msg_id);
+		if (s == "download") return ui_download_prompt(msg_id);
+		if (s == "notif") return ui_notif(msg_id);
+		if (s == "settings") return ui_settings(msg_id);
+		if (s == "simswitch") return ui_sim_switch(msg_id);
+		if (s == "eid") return ui_eid(msg_id);
+	}
+	if (c == "act") {
+		if (s == "status") return ui_modem(msg_id);
+		if (s == "notifprocess" || s == "notif_process") return do_notif_process();
+	}
+	if (c == "ren") { set_pending("rename", s); return update_ui(msg_id, `✏️ <b>Rename Profile</b>\nICCID: <code>${html(s)}</code>\n\nKirim nama baru 1–64 karakter.`, {inline_keyboard: [[{text: "❌ Cancel", callback_data: "cancel"}]]}); }
+	if (c == "simslot") return require_confirm("simslot", s, `⚠️ Switch SIM slot ke <b>${html(s)}</b>?`, "✅ Yes, Switch");
+	if (c == "sw") return require_confirm("switch", s, `⚠️ Switch ke <code>${html(s)}</code>?`, "✅ Yes, Switch");
+	if (c == "del") return require_confirm("delete", s, `🗑 Delete <code>${html(s)}</code>?`, "🗑 Yes, Delete");
+	if (c == "cfg") {
+		if (s == "backend" && (a == "qmi" || a == "mbim" || a == "at")) { uci_set("lpac-esim.main.apdu_backend", a); sys_exec("uci -q commit lpac-esim"); return ui_settings(msg_id); }
+		if (s == "toggle" && (a == "mbim_proxy" || a == "skip_slot_mapping" || a == "apdu_debug")) { let cur = uci_get(`lpac-esim.main.${a}`, "0"); uci_set(`lpac-esim.main.${a}`, cur == "1" ? "0" : "1"); sys_exec("uci -q commit lpac-esim"); return ui_settings(msg_id); }
+	}
+	return update_ui(msg_id, "⚠️ Callback tidak dikenal.", {inline_keyboard: INLINE_MENU});
 }
 
-###############################################################################
-# UI: Profile List (inline buttons: active=blue/locked, inactive=red/switch)
-###############################################################################
-
-send_profile_list() {
-    local raw
-    raw=$(lpac_api profiles)
-    local count
-    count=$(echo "$raw" | jq -r '.payload.data | length' 2>/dev/null)
-    [ -z "$count" ] || [ "$count" = "null" ] && count=0
-
-    if [ "$count" = "0" ]; then
-        tg_send_inline "📋 No profiles." \
-            '[[{"text":"📥 Download eSIM","callback_data":"menu:download","style":"success"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        return
-    fi
-
-    local text="📋 <b>Profiles</b> ($count)"
-    local kb_rows="" i=0 inactive_row=""
-
-    while [ $i -lt "$count" ]; do
-        local state name iccid
-        state=$(echo "$raw" | jq -r ".payload.data[$i].profileState")
-        name=$(echo "$raw" | jq -r ".payload.data[$i].profileNickname // .payload.data[$i].profileName // \"Profile $((i+1))\"")
-        iccid=$(echo "$raw" | jq -r ".payload.data[$i].iccid")
-
-        if [ "$state" = "enabled" ]; then
-            # Active: full-width BLUE button (locked) — style=primary
-            kb_rows="${kb_rows}[{\"text\":\"Aktif • $name 🔒\",\"callback_data\":\"noop\",\"style\":\"primary\"}],"
-        else
-            # Inactive: 2 per row, RED — style=danger
-            if [ -z "$inactive_row" ]; then
-                inactive_row="{\"text\":\"$name\",\"callback_data\":\"sw:$iccid\",\"style\":\"danger\"}"
-            else
-                kb_rows="${kb_rows}[$inactive_row,{\"text\":\"$name\",\"callback_data\":\"sw:$iccid\",\"style\":\"danger\"}],"
-                inactive_row=""
-            fi
-        fi
-        i=$((i + 1))
-    done
-    # Flush remaining single inactive button
-    [ -n "$inactive_row" ] && kb_rows="${kb_rows}[$inactive_row],"
-
-    # Bottom action buttons: Manage=primary, Download=success, Notif/Menu=default
-    kb_rows="${kb_rows}[{\"text\":\"⚡ Manage Profile\",\"callback_data\":\"menu:manage\",\"style\":\"primary\"}],"
-    kb_rows="${kb_rows}[{\"text\":\"📥 Download eSIM\",\"callback_data\":\"menu:download\",\"style\":\"success\"}],"
-    kb_rows="${kb_rows}[{\"text\":\"🔔 Notif\",\"callback_data\":\"act:notifprocess\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]"
-
-    tg_send_inline "$text" "[${kb_rows}]"
+function handle_message(chat_id, text) {
+	chat_id = `${chat_id || ""}`; text = `${text || ""}`;
+	if (chat_id != config.chat_id) { if (text == "/chatid" || text == "/start") tg_send(`Chat ID: <code>${html(chat_id)}</code>`); return; }
+	let pend = get_pending();
+	if (pend && pend.action == "download" && !pend.arg) {
+		if (text == "/cancel" || text == "❌ Cancel") { clear_pending(); return send_main_menu(); }
+		if (!is_lpa(text)) return tg_send("⚠️ Format LPA tidak valid. Contoh: <code>LPA:1$server$matchingId</code>", {inline_keyboard: [[{text: "❌ Cancel", callback_data: "cancel"}]]});
+		set_pending("download", text);
+		return tg_send("📥 Download ini?", {inline_keyboard: [[{text: "✅ Ya", callback_data: "confirm:yes"}, {text: "❌ Cancel", callback_data: "cancel"}]]});
+	}
+	if (pend && pend.action == "rename" && pend.arg) {
+		if (text == "/cancel" || text == "❌ Cancel") { clear_pending(); return send_main_menu(); }
+		let name = trim(text);
+		if (!name) return tg_send("⚠️ Nama tidak boleh kosong.");
+		if (length(name) > 64) return tg_send("⚠️ Nama terlalu panjang. Maksimal 64 karakter.");
+		clear_pending(); return do_rename(pend.arg, name);
+	}
+	if (text == "📱 Info EID" || text == "/eid" || text == "/info") return ui_eid(null);
+	if (text == "📋 Profile List" || text == "/profiles" || text == "/profile") return ui_profiles(null);
+	if (text == "📥 Download eSIM" || text == "/download") return ui_download_prompt(null);
+	if (text == "🔔 Notifications") return ui_notif(null);
+	if (text == "📡 Modem Status" || text == "/status") return ui_modem(null);
+	if (text == "⚙️ Settings" || text == "/settings") return ui_settings(null);
+	if (text == "❓ Help" || text == "/help") return ui_help();
+	if (text == "🏠 Menu" || text == "Menu" || text == "Menu Utama" || text == "/start" || text == "/menu") return send_main_menu();
+	if (text == "/chatid") return tg_send(`Chat ID: <code>${html(chat_id)}</code>`);
+	if (text == "/notif") return do_notif_process();
+	if (text == "/cancel") { clear_pending(); return send_main_menu(); }
+	if (match(text, /^\/download\s+/)) { let lpa = replace(text, /^\/download\s+/, ""); if (!is_lpa(lpa)) return tg_send("⚠️ Format: /download LPA:1$server$matchingId"); return require_confirm("download", lpa, "📥 Download ini?", "✅ Ya"); }
+	if (match(text, /^\/(enable|switch)\s+/)) { let iccid = replace(text, /^\/(enable|switch)\s+/, ""); return require_confirm("switch", iccid, `⚠️ Switch ke <code>${html(iccid)}</code>?`, "✅ Ya"); }
+	if (text == "/enable" || text == "/switch") return tg_send("⚠️ Format: /enable &lt;ICCID&gt;");
+	if (match(text, /^\/delete\s+/)) { let iccid = replace(text, /^\/delete\s+/, ""); return require_confirm("delete", iccid, `🗑 Delete <code>${html(iccid)}</code>?`, "🗑 Ya"); }
+	if (text == "/delete") return tg_send("⚠️ Format: /delete &lt;ICCID&gt;");
+	return send_main_menu();
 }
 
-###############################################################################
-# UI: Modem Status
-###############################################################################
-
-send_modem_status() {
-    local at_port="" modem_sec="" manufacturer=""
-    modem_sec=$(get_modem_section)
-    [ -n "$modem_sec" ] && {
-        at_port=$(uci -q get "xmodem.${modem_sec}.at_port")
-        manufacturer=$(uci -q get "xmodem.${modem_sec}.manufacturer")
-    }
-
-    if [ -z "$at_port" ] || [ ! -e "$at_port" ] || [ ! -x /usr/bin/sms_tool_q ]; then
-        tg_send_inline "❌ AT port not available." '[[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        return
-    fi
-
-    local resp="" model="-" fw="-" imei="-" op="-" tech="-" state="-"
-    local sig_pct="-" sig_dbm="-" temp="-"
-    local rsrp="-" rsrq="-" rssi="-" sinr="-"
-    local pband="-" pci="-" earfcn="-" ca_bands=""
-
-    # Parsed modem data from the xmodem backend (vendor-correct for L850/XMM etc.)
-    local bi ni ci
-    bi=$(ubus call xmodem base_info "{\"config_section\":\"$modem_sec\"}" 2>/dev/null)
-    ni=$(ubus call xmodem network_info "{\"config_section\":\"$modem_sec\"}" 2>/dev/null)
-    ci=$(ubus call xmodem cell_info "{\"config_section\":\"$modem_sec\"}" 2>/dev/null)
-    jget() { echo "$1" | jq -r --arg k "$2" '.modem_info[]? | select(.key==$k) | .value' 2>/dev/null | head -1; }
-
-    # Model & Firmware (clean from backend; fallback to AT+CGMx with prefix/quote strip)
-    local mfr=$(jget "$bi" manufacturer) mdl=$(jget "$bi" name)
-    if [ -z "${mfr}${mdl}" ]; then
-        resp=$(sms_tool_q -d "$at_port" at "AT+CGMI" 2>/dev/null)
-        mfr=$(echo "$resp" | grep -v "^AT\|^OK\|^$" | head -1 | sed 's/^+CGMI: *//;s/"//g' | tr -d '\r')
-        resp=$(sms_tool_q -d "$at_port" at "AT+CGMM" 2>/dev/null)
-        mdl=$(echo "$resp" | grep -v "^AT\|^OK\|^$" | head -1 | sed 's/^+CGMM: *//;s/"//g;s/,.*//' | tr -d '\r')
-    fi
-    model="${mfr} ${mdl}"
-    fw=$(jget "$bi" revision)
-    if [ -z "$fw" ]; then
-        resp=$(sms_tool_q -d "$at_port" at "AT+CGMR" 2>/dev/null)
-        fw=$(echo "$resp" | grep -v "^AT\|^OK\|^$" | head -1 | sed 's/^+CGMR: *//;s/"//g' | tr -d '\r')
-    fi
-
-    # IMEI
-    resp=$(sms_tool_q -d "$at_port" at "AT+CGSN" 2>/dev/null)
-    imei=$(echo "$resp" | grep -o '[0-9]\{15\}' | head -1)
-
-    # Operator & Technology (AT+COPS?)
-    resp=$(sms_tool_q -d "$at_port" at "AT+COPS?" 2>/dev/null)
-    if echo "$resp" | grep -q '+COPS:'; then
-        op=$(echo "$resp" | grep '+COPS:' | sed 's/.*"\(.*\)".*/\1/')
-        # If no quoted string found (numeric mode), extract raw
-        echo "$op" | grep -q "COPS" && op=$(echo "$resp" | grep '+COPS:' | awk -F, '{gsub(/"/,"",$3); print $3}')
-        local act=$(echo "$resp" | grep '+COPS:' | grep -o ',[0-9]*$' | tr -d ',')
-        case "$act" in
-            7) tech="LTE" ;; 12) tech="NR 5G" ;; 13) tech="5G NSA" ;;
-            0) tech="GSM" ;; 2) tech="UTRAN" ;; 6) tech="HSPA+" ;;
-        esac
-    fi
-    # Prefer backend-parsed network type (e.g. LTE / 5G NSA) when available
-    local nt=$(jget "$ni" "Network Type"); [ -n "$nt" ] && tech="$nt"
-
-    # Signal CSQ
-    resp=$(sms_tool_q -d "$at_port" at "AT+CSQ" 2>/dev/null)
-    if echo "$resp" | grep -q '+CSQ:'; then
-        local csq=$(echo "$resp" | grep '+CSQ:' | sed 's/+CSQ: *\([0-9]*\).*/\1/')
-        if [ -n "$csq" ] && [ "$csq" != "99" ]; then
-            sig_dbm=$(( csq * 2 - 113 ))
-            sig_pct=$(( csq * 100 / 31 ))
-            [ "$sig_pct" -gt 100 ] && sig_pct=100
-        fi
-    fi
-
-    # Registration (AT+CEREG?)
-    resp=$(sms_tool_q -d "$at_port" at "AT+CEREG?" 2>/dev/null)
-    if echo "$resp" | grep -q '+CEREG:'; then
-        local reg=$(echo "$resp" | grep '+CEREG:' | sed 's/+CEREG: *[0-9]*,\([0-9]*\).*/\1/')
-        case "$reg" in
-            1) state="Registered (Home)" ;; 5) state="Roaming" ;;
-            2) state="Searching" ;; 3) state="Denied" ;; 0) state="Not registered" ;;
-        esac
-    fi
-
-    # === Foxconn T99W175 specific: AT^TEMP? and AT^DEBUG? ===
-    # Temperature
-    resp=$(sms_tool_q -d "$at_port" at "AT^TEMP?" 2>/dev/null)
-    if echo "$resp" | grep -qi "TSENS\|PA\|Skin"; then
-        local t1=$(echo "$resp" | awk '/TSENS/ {gsub("C","",$2); print $2}')
-        local t2=$(echo "$resp" | awk '/PA/ {gsub("C","",$2); print $2}')
-        [ -n "$t1" ] && temp="${t1}°C"
-        [ -n "$t2" ] && [ -n "$t1" ] && [ "$t2" -gt "$t1" ] 2>/dev/null && temp="${t2}°C"
-    fi
-
-    # Cell / signal detail — primary source: xmodem backend (vendor-correct, L850/XMM)
-    local v
-    v=$(jget "$ci" "Band"); [ -n "$v" ] && pband="B${v}"
-    v=$(jget "$ci" "DL Bandwidth"); [ "$pband" != "-" ] && [ -n "$v" ] && pband="${pband} @${v}MHz"
-    v=$(jget "$ci" "Physical Cell ID"); [ -n "$v" ] && pci="$v"
-    v=$(jget "$ci" "EARFCN"); [ -n "$v" ] && earfcn="$v"
-    v=$(jget "$ci" "RSRP"); [ -n "$v" ] && rsrp="${v}dBm"
-    v=$(jget "$ci" "RSRQ"); [ -n "$v" ] && rsrq="${v}dB"
-    v=$(jget "$ci" "RSSI"); [ -n "$v" ] && rssi="${v}dBm"
-    v=$(jget "$ci" "SINR"); [ -n "$v" ] && sinr="${v}dB"
-    v=$(jget "$ci" "NR Band"); [ -n "$v" ] && ca_bands="n${v}"
-
-    # Fallback: Foxconn/Qualcomm proprietary AT^DEBUG? when the backend gave nothing
-    if [ "$pband" = "-" ] && [ "$rsrp" = "-" ]; then
-        resp=$(sms_tool_q -d "$at_port" at "AT^DEBUG?" 2>/dev/null)
-        if echo "$resp" | grep -qi "pcell\|lte_rsrp"; then
-            echo "$resp" | grep -q "scell:" && tech="LTE-A"
-            echo "$resp" | grep -q "nr_band:" && tech="5G NSA"
-            local pcell_line=$(echo "$resp" | grep "^pcell:")
-            local pb=$(echo "$pcell_line" | grep -o 'lte_band:[0-9]*' | head -1 | cut -d: -f2)
-            local bw=$(echo "$pcell_line" | grep -o 'lte_band_width:[0-9.]*MHz' | head -1 | cut -d: -f2)
-            [ -n "$pb" ] && pband="B${pb}"
-            [ -n "$bw" ] && pband="${pband} @${bw}"
-            local chan_line=$(echo "$resp" | grep -A1 "^pcell:" | grep "channel:")
-            pci=$(echo "$chan_line" | grep -o 'pci:[0-9]*' | head -1 | cut -d: -f2)
-            earfcn=$(echo "$chan_line" | grep -o 'channel:[0-9]*' | head -1 | cut -d: -f2)
-            local rsrp_line=$(echo "$resp" | grep -A2 "^pcell:" | grep "lte_rsrp:")
-            rsrp=$(echo "$rsrp_line" | grep -o 'lte_rsrp:[^,]*' | head -1 | cut -d: -f2)
-            rsrq=$(echo "$rsrp_line" | grep -o 'rsrq:[^,]*' | head -1 | cut -d: -f2)
-            local rssi_line=$(echo "$resp" | grep -A3 "^pcell:" | grep "lte_rssi:")
-            rssi=$(echo "$rssi_line" | grep -o 'lte_rssi:[^,]*' | head -1 | cut -d: -f2)
-            sinr=$(echo "$rssi_line" | grep -o 'lte_snr:[^,]*' | head -1 | cut -d: -f2)
-            [ "$sinr" = "NA" ] && sinr="-"
-            local scell_bands=$(echo "$resp" | grep "^scell:" | grep -o 'lte_band:[0-9]*' | cut -d: -f2 | awk '{printf "B%s+", $1}' | sed 's/+$//')
-            [ -n "$scell_bands" ] && ca_bands="$scell_bands"
-        fi
-    fi
-
-    # Signal bar
-    local sig_bar="░░░░░"
-    if [ "$sig_pct" != "-" ]; then
-        local p=$sig_pct
-        if [ "$p" -ge 80 ]; then sig_bar="▁▃▅▇█"
-        elif [ "$p" -ge 60 ]; then sig_bar="▁▃▅▇░"
-        elif [ "$p" -ge 40 ]; then sig_bar="▁▃▅░░"
-        elif [ "$p" -ge 20 ]; then sig_bar="▁▃░░░"
-        else sig_bar="▁░░░░"
-        fi
-    fi
-
-    # Build message
-    local text="📡 <b>Modem Status</b>
-
-<b>Signal:</b> $sig_bar ${sig_pct}% (${sig_dbm} dBm)
-<b>Operator:</b> $op
-<b>Technology:</b> $tech
-<b>State:</b> $state"
-
-    [ "$pband" != "-" ] && text="${text}
-<b>Band:</b> $pband"
-    [ -n "$ca_bands" ] && text="${text} + $ca_bands"
-    [ "$pci" != "-" ] && [ -n "$pci" ] && text="${text}
-<b>PCI:</b> $pci | <b>EARFCN:</b> $earfcn"
-
-    # Signal detail section
-    if [ "$rsrp" != "-" ] || [ "$rssi" != "-" ]; then
-        text="${text}
-
-📶 <b>Signal Detail:</b>"
-        [ "$rsrp" != "-" ] && text="${text}
-  RSRP: <code>$rsrp</code>"
-        [ "$rsrq" != "-" ] && text="${text} | RSRQ: <code>$rsrq</code>"
-        [ "$rssi" != "-" ] && text="${text}
-  RSSI: <code>$rssi</code>"
-        [ "$sinr" != "-" ] && text="${text} | SINR: <code>$sinr</code>"
-    fi
-
-    # Modem info section
-    text="${text}
-
-📋 <b>Modem:</b> <code>$model</code>"
-    [ "$fw" != "-" ] && [ -n "$fw" ] && text="${text}
-<b>FW:</b> <code>$fw</code>"
-    [ "$temp" != "-" ] && text="${text} | <b>Temp:</b> $temp"
-    [ -n "$imei" ] && text="${text}
-<b>IMEI:</b> <code>$imei</code>"
-
-    tg_send_inline "$text" \
-        '[[{"text":"🔄 Refresh","callback_data":"act:status"},{"text":"🏠 Menu","callback_data":"menu:main"}]]'
+function process_update(u) {
+	if (!u || !exists(u, "update_id")) return;
+	if (u.update_id > last_update_id) last_update_id = u.update_id;
+	if (exists(u, "callback_query") && u.callback_query) {
+		let cb = u.callback_query;
+		let msg = cb.message || {};
+		let chat = msg.chat ? `${msg.chat.id}` : "";
+		let mid = msg.message_id || null;
+		handle_callback(cb.id || "", cb.data || "", chat, mid);
+		return;
+	}
+	if (exists(u, "message") && u.message) {
+		let chat = u.message.chat ? `${u.message.chat.id}` : "";
+		let text = u.message.text || "";
+		if (text) handle_message(chat, text);
+	}
 }
 
-###############################################################################
-# UI: Settings (toggle buttons for backend config)
-###############################################################################
-
-send_settings() {
-    local backend proxy skip_slot debug_on
-    backend=$(uci -q get lpac-esim.main.apdu_backend || echo "mbim")
-    proxy=$(uci -q get lpac-esim.main.mbim_proxy || echo "1")
-    skip_slot=$(uci -q get lpac-esim.main.skip_slot_mapping || echo "1")
-    debug_on=$(uci -q get lpac-esim.main.apdu_debug || echo "0")
-
-    # Backend buttons: active=primary(blue), inactive=danger(red)
-    local qmi_s="danger" mbim_s="danger" at_s="danger"
-    case "$backend" in
-        qmi)  qmi_s="primary" ;;
-        mbim) mbim_s="primary" ;;
-        at)   at_s="primary" ;;
-    esac
-
-    # Toggle buttons: ON=primary(blue), OFF=danger(red)
-    local p_s="danger" ss_s="danger" d_s="danger"
-    [ "$proxy" = "1" ] && p_s="primary"
-    [ "$skip_slot" = "1" ] && ss_s="primary"
-    [ "$debug_on" = "1" ] && d_s="primary"
-
-    local p_t="OFF" ss_t="OFF" d_t="OFF"
-    [ "$proxy" = "1" ] && p_t="ON"
-    [ "$skip_slot" = "1" ] && ss_t="ON"
-    [ "$debug_on" = "1" ] && d_t="ON"
-
-    local text="⚙️ <b>Settings</b>
-
-<b>Backend:</b> <code>$backend</code>
-<b>MBIM Proxy:</b> $p_t
-<b>Skip Slot Mapping:</b> $ss_t
-<b>Debug:</b> $d_t"
-
-    local kb="[
-        [{\"text\":\"Backend QMI\",\"callback_data\":\"cfg:backend:qmi\",\"style\":\"$qmi_s\"},{\"text\":\"Backend MBIM\",\"callback_data\":\"cfg:backend:mbim\",\"style\":\"$mbim_s\"},{\"text\":\"Backend AT\",\"callback_data\":\"cfg:backend:at\",\"style\":\"$at_s\"}],
-        [{\"text\":\"MBIM Proxy: $p_t\",\"callback_data\":\"cfg:toggle:mbim_proxy\",\"style\":\"$p_s\"},{\"text\":\"Skip Slot: $ss_t\",\"callback_data\":\"cfg:toggle:skip_slot_mapping\",\"style\":\"$ss_s\"}],
-        [{\"text\":\"Debug: $d_t\",\"callback_data\":\"cfg:toggle:apdu_debug\",\"style\":\"$d_s\"}],
-        [{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]
-    ]"
-    tg_send_inline "$text" "$kb"
+function cleanup() { fs.unlink(PID_FILE); write_status("stopped", 0); }
+function main() {
+	if (!load_config()) { log("Disabled/Unconfigured"); return; }
+	ensure_state_dir();
+	let pf = fs.open(PID_FILE, "w"); if (pf) { pf.write(current_pid()); pf.close(); }
+	load_offset(); write_status("starting", 0); log("Ucode Bot ready.");
+	let fail = 0;
+	while (true) {
+		let off = last_update_id + 1;
+		let r = sys(`curl -s -m 35 ${sh_quote(`${tg_api}/getUpdates?offset=${off}&timeout=25`)}`);
+		let data = null; try { data = json(r); } catch (e) {}
+		if (!data || !data.ok) { fail++; write_status("error", fail); log_debug(`getUpdates failed: ${r}`); sys_exec("sleep 10"); continue; }
+		fail = 0; write_status("ok", 0);
+		if (data.result && length(data.result) > 0) {
+			for (let i = 0; i < length(data.result); i++) process_update(data.result[i]);
+			save_offset();
+		}
+		if (config.poll_interval > 0) sys_exec(`sleep ${config.poll_interval}`);
+	}
 }
-
-###############################################################################
-# UI: Download eSIM prompt
-###############################################################################
-
-send_download_prompt() {
-    clear_pending
-    save_pending "download" ""
-    tg_send_inline "📥 <b>Download eSIM</b>
-
-Send activation code in format:
-<code>LPA:1\$smdp.example.com\$MATCHING-ID</code>
-
-Or tap Cancel." \
-        '[[{"text":"❌ Cancel","callback_data":"cancel"}]]'
-}
-
-###############################################################################
-# UI: Notifications
-###############################################################################
-
-send_notif_list() {
-    local raw
-    raw=$(lpac_api notif-list)
-    local code count
-    code=$(echo "$raw" | jq -r '.payload.code // 99')
-    if [ "$code" = "0" ]; then
-        count=$(echo "$raw" | jq -r '.payload.data | length // 0' 2>/dev/null)
-        [ -z "$count" ] && count=0
-        tg_send_inline "🔔 Pending: $count" \
-            '[[{"text":"⚡ Process All","callback_data":"act:notifprocess"},{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    else
-        tg_send_inline "❌ Failed to read notifications." '[[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    fi
-}
-
-###############################################################################
-# UI: Manage Profile (delete buttons, active locked out)
-###############################################################################
-
-send_manage_menu() {
-    local raw
-    raw=$(lpac_api profiles)
-    local count
-    count=$(echo "$raw" | jq -r '.payload.data | length' 2>/dev/null)
-    [ -z "$count" ] || [ "$count" = "null" ] && count=0
-
-    if [ "$count" = "0" ]; then
-        tg_send_inline "🗑 No profiles." '[[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        return
-    fi
-
-    local kb_rows="" i=0 has_disabled=0 pend_row=""
-
-    while [ $i -lt "$count" ]; do
-        local state name iccid
-        state=$(echo "$raw" | jq -r ".payload.data[$i].profileState")
-        name=$(echo "$raw" | jq -r ".payload.data[$i].profileNickname // .payload.data[$i].profileName // \"Profile $((i+1))\"")
-        iccid=$(echo "$raw" | jq -r ".payload.data[$i].iccid")
-
-        if [ "$state" != "enabled" ]; then
-            has_disabled=1
-            # 2 per row (match profile list layout)
-            if [ -z "$pend_row" ]; then
-                pend_row="{\"text\":\"🗑 $name\",\"callback_data\":\"del:$iccid\"}"
-            else
-                kb_rows="${kb_rows}[$pend_row,{\"text\":\"🗑 $name\",\"callback_data\":\"del:$iccid\"}],"
-                pend_row=""
-            fi
-        fi
-        i=$((i + 1))
-    done
-    # Flush remaining single button
-    [ -n "$pend_row" ] && kb_rows="${kb_rows}[$pend_row],"
-
-    if [ "$has_disabled" = "0" ]; then
-        tg_send_inline "🗑 All profiles are active, cannot delete." \
-            '[[{"text":"📋 Profiles","callback_data":"menu:profiles"},{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        return
-    fi
-
-    kb_rows="${kb_rows}[{\"text\":\"✏️ Rename Profile\",\"callback_data\":\"menu:rename\",\"style\":\"primary\"}],"
-    kb_rows="${kb_rows}[{\"text\":\"📋 Profiles\",\"callback_data\":\"menu:profiles\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]"
-    tg_send_inline "🗑 <b>Delete Profile</b>" "[${kb_rows}]"
-}
-
-###############################################################################
-# UI: SIM Switch (show current slot, buttons to switch)
-###############################################################################
-
-send_sim_switch() {
-    local modem_sec=$(get_modem_section)
-    if [ -z "$modem_sec" ]; then
-        tg_send_inline "❌ No modem detected." '[[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        return
-    fi
-
-    # Get current SIM slot via AT command
-    local at_port=$(uci -q get "xmodem.${modem_sec}.at_port")
-    local cur_slot="?"
-    local manufacturer=$(uci -q get "xmodem.${modem_sec}.manufacturer")
-
-    if [ -n "$at_port" ] && [ -e "$at_port" ] && [ -x /usr/bin/sms_tool_q ]; then
-        local sim_resp=""
-        case "$manufacturer" in
-            foxconn)
-                # Foxconn T99W175: AT^SWITCH_SLOT? → "SIM1 ENABLE" or "SIM2 ENABLE"
-                # SIM1 = physical SIM (slot 0), SIM2 = eSIM (slot 1)
-                sim_resp=$(sms_tool_q -d "$at_port" at "AT^SWITCH_SLOT?" 2>/dev/null)
-                if echo "$sim_resp" | grep -qi "SIM1"; then
-                    cur_slot="0"
-                elif echo "$sim_resp" | grep -qi "SIM2"; then
-                    cur_slot="1"
-                fi
-                ;;
-            quectel)
-                # Quectel: AT+QUIMSLOT? → +QUIMSLOT: 1 or 2
-                sim_resp=$(sms_tool_q -d "$at_port" at "AT+QUIMSLOT?" 2>/dev/null)
-                if echo "$sim_resp" | grep -q "+QUIMSLOT:"; then
-                    cur_slot=$(echo "$sim_resp" | grep "+QUIMSLOT:" | sed 's/+QUIMSLOT: *//;s/\r//')
-                fi
-                ;;
-            *)
-                # Generic fallback: try both
-                sim_resp=$(sms_tool_q -d "$at_port" at "AT^SWITCH_SLOT?" 2>/dev/null)
-                if echo "$sim_resp" | grep -qi "SWITCH_SLOT"; then
-                    cur_slot=$(echo "$sim_resp" | grep -i "SWITCH_SLOT" | sed 's/.*: *//;s/\r//')
-                else
-                    sim_resp=$(sms_tool_q -d "$at_port" at "AT+QUIMSLOT?" 2>/dev/null)
-                    if echo "$sim_resp" | grep -q "+QUIMSLOT:"; then
-                        cur_slot=$(echo "$sim_resp" | grep "+QUIMSLOT:" | sed 's/+QUIMSLOT: *//;s/\r//')
-                    fi
-                fi
-                ;;
-        esac
-    fi
-
-    # For Foxconn: slot 0 = SIM card, slot 1 = eSIM
-    # Fallback to UCI if AT command didn't work
-    if [ "$cur_slot" = "?" ]; then
-        cur_slot=$(uci -q get "xmodem.${modem_sec}.sim_slot" 2>/dev/null)
-        [ -z "$cur_slot" ] && cur_slot="1"
-    fi
-
-    local slot_label=""
-    case "$manufacturer" in
-        foxconn)
-            case "$cur_slot" in
-                0) slot_label="SIM Card (Slot 0)" ;;
-                1) slot_label="eSIM (Slot 1)" ;;
-                *) slot_label="Unknown ($cur_slot)" ;;
-            esac
-            ;;
-        *)
-            slot_label="Slot $cur_slot"
-            ;;
-    esac
-
-    local text="🔄 <b>SIM Switch</b>
-
-Current: <b>$slot_label</b>
-Modem: <code>$modem_sec</code> ($manufacturer)
-
-📌 <b>SIM Card</b> = Physical nano-SIM slot
-📌 <b>eSIM</b> = Embedded eUICC (removable 9eSIM)
-
-⚠️ Switching will briefly disconnect internet."
-
-    # Build buttons based on manufacturer
-    local kb=""
-    case "$manufacturer" in
-        foxconn)
-            # Foxconn: 0=SIM Card, 1=eSIM
-            local s0_style="danger" s1_style="danger"
-            [ "$cur_slot" = "0" ] && s0_style="primary"
-            [ "$cur_slot" = "1" ] && s1_style="primary"
-            kb="[[{\"text\":\"SIM Card\",\"callback_data\":\"simslot:0\",\"style\":\"$s0_style\"},{\"text\":\"eSIM\",\"callback_data\":\"simslot:1\",\"style\":\"$s1_style\"}],[{\"text\":\"📱 EID Info\",\"callback_data\":\"menu:eid\",\"style\":\"primary\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]]"
-            ;;
-        *)
-            # Generic: Slot 1, Slot 2
-            local s1_style="danger" s2_style="danger"
-            [ "$cur_slot" = "1" ] && s1_style="primary"
-            [ "$cur_slot" = "2" ] && s2_style="primary"
-            kb="[[{\"text\":\"Slot 1\",\"callback_data\":\"simslot:1\",\"style\":\"$s1_style\"},{\"text\":\"Slot 2\",\"callback_data\":\"simslot:2\",\"style\":\"$s2_style\"}],[{\"text\":\"📱 EID Info\",\"callback_data\":\"menu:eid\",\"style\":\"primary\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]]"
-            ;;
-    esac
-
-    tg_send_inline "$text" "$kb"
-}
-
-###############################################################################
-# UI: Rename Profile (select profile → enter new name)
-###############################################################################
-
-send_rename_menu() {
-    local raw
-    raw=$(lpac_api profiles)
-    local count
-    count=$(echo "$raw" | jq -r '.payload.data | length' 2>/dev/null)
-    [ -z "$count" ] || [ "$count" = "null" ] && count=0
-
-    if [ "$count" = "0" ]; then
-        tg_send_inline "✏️ No profiles." '[[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        return
-    fi
-
-    local kb_rows="" i=0 pend_row=""
-
-    while [ $i -lt "$count" ]; do
-        local name iccid
-        name=$(echo "$raw" | jq -r ".payload.data[$i].profileNickname // .payload.data[$i].profileName // \"Profile $((i+1))\"")
-        iccid=$(echo "$raw" | jq -r ".payload.data[$i].iccid")
-        # 2 per row (match profile list layout)
-        if [ -z "$pend_row" ]; then
-            pend_row="{\"text\":\"✏️ $name\",\"callback_data\":\"ren:$iccid\"}"
-        else
-            kb_rows="${kb_rows}[$pend_row,{\"text\":\"✏️ $name\",\"callback_data\":\"ren:$iccid\"}],"
-            pend_row=""
-        fi
-        i=$((i + 1))
-    done
-    [ -n "$pend_row" ] && kb_rows="${kb_rows}[$pend_row],"
-
-    kb_rows="${kb_rows}[{\"text\":\"📋 Profiles\",\"callback_data\":\"menu:profiles\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]"
-    tg_send_inline "✏️ <b>Rename Profile</b>
-
-Select profile to rename:" "[${kb_rows}]"
-}
-
-###############################################################################
-# Lock Polling (wait for async backend operation to finish)
-###############################################################################
-
-poll_lock_result() {
-    local timeout="${1:-120}"
-    local elapsed=0
-    while [ $elapsed -lt "$timeout" ]; do
-        sleep 5
-        elapsed=$((elapsed + 5))
-        local lock_raw
-        lock_raw=$(lpac_api lock-status)
-        local locked
-        locked=$(echo "$lock_raw" | jq -r '.payload.data.locked // false')
-        if [ "$locked" != "true" ]; then
-            # Operation finished — return the last_result if available
-            echo "$lock_raw" | jq -r '.payload.data.last_result // empty' 2>/dev/null
-            return 0
-        fi
-    done
-    return 124  # timeout
-}
-
-###############################################################################
-# Actions (disruptive operations with confirmation)
-###############################################################################
-
-do_switch() {
-    local iccid="$1"
-    tg_send "⏳"
-    local section result status
-    section=$(get_modem_section)
-    if [ -n "$section" ]; then
-        result=$(/usr/share/xmodem/esim_ctrl.sh profile_enable "$section" "{\"iccid\":\"$iccid\",\"refresh\":\"1\"}")
-    else
-        result='{"result":{"status":"0","error":"no modem section"}}'
-    fi
-    status=$(echo "$result" | jq -r '.result.status // "0"')
-    if [ "$status" = "1" ]; then
-        # Internet was down during switch — retry sending result
-        tg_send_retry "✅ <b>Profile Switched</b>
-
-ICCID: <code>$iccid</code>
-Internet reconnected." \
-            '[[{"text":"📋 Profile List","callback_data":"menu:profiles"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    else
-        local err
-        err=$(echo "$result" | jq -r '.result.error // "Unknown"')
-        tg_send_retry "❌ <b>Switch Failed</b>
-
-Error: $err" \
-            '[[{"text":"📋 Profile List","callback_data":"menu:profiles"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    fi
-}
-
-do_delete() {
-    local iccid="$1"
-    tg_send "⏳"
-    local section result status
-    section=$(get_modem_section)
-    if [ -n "$section" ]; then
-        result=$(/usr/share/xmodem/esim_ctrl.sh profile_delete "$section" "{\"iccid\":\"$iccid\"}")
-    else
-        result='{"result":{"status":"0","error":"no modem section"}}'
-    fi
-    status=$(echo "$result" | jq -r '.result.status // "0"')
-    if [ "$status" = "1" ]; then
-        tg_send_inline "✅ Profile deleted." \
-            '[[{"text":"📋 Profile List","callback_data":"menu:profiles"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    else
-        local err
-        err=$(echo "$result" | jq -r '.result.error // "Unknown"')
-        tg_send_inline "❌ Delete failed: $err" \
-            '[[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    fi
-}
-
-do_download() {
-    local lpa="$1"
-    tg_send "⏳"
-    local result code msg
-    result=$(lpac_api download --lpa "$lpa")
-    code=$(echo "$result" | jq -r '.payload.code // 99')
-    msg=$(echo "$result" | jq -r '.payload.message // ""')
-
-    # Check if backend returned "processing" (async operation)
-    if [ "$msg" = "processing" ]; then
-        # Poll immediately first (operation may fail fast before 5s delay)
-        sleep 2
-        local lock_result="" poll_rc=0
-        local lock_raw
-        lock_raw=$(lpac_api lock-status)
-        local locked=$(echo "$lock_raw" | jq -r '.payload.data.locked // false')
-        if [ "$locked" != "true" ]; then
-            # Already finished (fast fail or fast success)
-            lock_result=$(echo "$lock_raw" | jq -r '.payload.data.last_result // empty' 2>/dev/null)
-        else
-            # Still processing — continue polling
-            lock_result=$(poll_lock_result 180)
-            poll_rc=$?
-        fi
-
-        # Analyze result
-        local is_error=0
-        if [ -z "$lock_result" ]; then
-            # Empty result — re-check one more time
-            sleep 2
-            local final_raw=$(lpac_api lock-status)
-            lock_result=$(echo "$final_raw" | jq -r '.payload.data.last_result // empty' 2>/dev/null)
-            # If still empty, check syslog for FAILED message
-            if [ -z "$lock_result" ]; then
-                local syslog_check=$(logread -l 20 2>/dev/null | grep -i "lpac-esim.*FAIL\|download.*FAILED" | tail -1)
-                if [ -n "$syslog_check" ]; then
-                    is_error=1
-                    lock_result=$(echo "$syslog_check" | sed 's/.*: //')
-                fi
-            fi
-        fi
-
-        if [ -n "$lock_result" ] && [ "$is_error" = "0" ]; then
-            local res_success=$(echo "$lock_result" | jq -r '.success // empty' 2>/dev/null)
-            local res_msg=$(echo "$lock_result" | jq -r '.message // empty' 2>/dev/null)
-            [ -z "$res_msg" ] && res_msg="$lock_result"
-            if [ "$res_success" = "false" ] || [ "$res_success" = "error" ] || \
-               echo "$res_msg" | grep -qi "fail\|error\|FAILED"; then
-                is_error=1
-                lock_result="$res_msg"
-            fi
-        fi
-
-        if [ "$is_error" = "1" ]; then
-            tg_send_inline "❌ <b>Download Failed</b>
-
-$lock_result" \
-                '[[{"text":"📥 Try Again","callback_data":"menu:download"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        elif [ $poll_rc -eq 124 ]; then
-            tg_send_inline "⚠️ <b>Download timeout</b>
-
-Check Profile List for status." \
-                '[[{"text":"📋 Profile List","callback_data":"menu:profiles"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        else
-            tg_send_inline "✅ <b>Profile Downloaded</b>
-
-Use Profile List to view and switch." \
-                '[[{"text":"📋 Profile List","callback_data":"menu:profiles"},{"text":"🔔 Process Notif","callback_data":"act:notifprocess"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        fi
-        return
-    fi
-
-    if [ "$code" = "0" ]; then
-        tg_send_inline "✅ <b>Profile Downloaded</b>
-
-Use Profile List to view and switch." \
-            '[[{"text":"📋 Profile List","callback_data":"menu:profiles"},{"text":"🔔 Process Notif","callback_data":"act:notifprocess"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    else
-        [ -z "$msg" ] && msg="Unknown error"
-        tg_send_inline "❌ <b>Download Failed</b>
-
-Error: $msg" \
-            '[[{"text":"📥 Try Again","callback_data":"menu:download"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    fi
-}
-
-do_notif_process() {
-    tg_send "⏳"
-    local result code
-    result=$(lpac_api notif-process)
-    code=$(echo "$result" | jq -r '.payload.code // 99')
-    if [ "$code" = "0" ]; then
-        tg_send_inline "✅ Notifications processed." \
-            '[[{"text":"📋 Profile List","callback_data":"menu:profiles"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    else
-        tg_send_inline "❌ Failed to process notifications." \
-            '[[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-    fi
-}
-
-do_simslot() {
-    local slot="$1"
-    tg_send "⏳"
-    local modem_sec=$(get_modem_section)
-    local at_port=$(uci -q get "xmodem.${modem_sec}.at_port")
-    local manufacturer=$(uci -q get "xmodem.${modem_sec}.manufacturer")
-
-    if [ -z "$at_port" ] || [ ! -e "$at_port" ] || [ ! -x /usr/bin/sms_tool_q ]; then
-        tg_send "❌ AT port not available."
-        return
-    fi
-
-    local at_cmd=""
-    case "$manufacturer" in
-        foxconn) at_cmd="AT^SWITCH_SLOT=$slot" ;;
-        quectel) at_cmd="AT+QUIMSLOT=$slot" ;;
-        *)       at_cmd="AT^SWITCH_SLOT=$slot" ;;
-    esac
-
-    # Send switch command (response may not contain "OK" on some modems)
-    sms_tool_q -d "$at_port" at "$at_cmd" >/dev/null 2>&1
-
-    # Wait for modem to process the switch
-    sleep 3
-
-    # Verify by querying current slot
-    local verify_resp="" actual_slot="?"
-    case "$manufacturer" in
-        foxconn)
-            verify_resp=$(sms_tool_q -d "$at_port" at "AT^SWITCH_SLOT?" 2>/dev/null)
-            if echo "$verify_resp" | grep -qi "SIM1"; then
-                actual_slot="0"
-            elif echo "$verify_resp" | grep -qi "SIM2"; then
-                actual_slot="1"
-            fi
-            ;;
-        quectel)
-            verify_resp=$(sms_tool_q -d "$at_port" at "AT+QUIMSLOT?" 2>/dev/null)
-            if echo "$verify_resp" | grep -q "+QUIMSLOT:"; then
-                actual_slot=$(echo "$verify_resp" | grep "+QUIMSLOT:" | grep -o '[0-9]' | head -1)
-            fi
-            ;;
-    esac
-
-    local slot_name="Slot $slot"
-    local actual_name="Slot $actual_slot"
-    [ "$manufacturer" = "foxconn" ] && {
-        [ "$slot" = "0" ] && slot_name="SIM Card"
-        [ "$slot" = "1" ] && slot_name="eSIM"
-        [ "$actual_slot" = "0" ] && actual_name="SIM Card"
-        [ "$actual_slot" = "1" ] && actual_name="eSIM"
-    }
-
-    if [ "$actual_slot" = "$slot" ]; then
-        uci -q set "xmodem.${modem_sec}.sim_slot=$slot"
-        uci -q commit xmodem
-        # Internet may drop — use retry
-        tg_send_retry "✅ <b>SIM Slot Switched</b>
-
-Active: <b>$slot_name</b>" \
-            "[[{\"text\":\"🔄 SIM Switch\",\"callback_data\":\"menu:simswitch\",\"style\":\"primary\"},{\"text\":\"📱 EID Info\",\"callback_data\":\"menu:eid\"}],[{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]]"
-    elif [ "$actual_slot" = "?" ]; then
-        # Could not verify (AT port may be temporarily unavailable during switch)
-        # Assume success if we got here without error, verify later
-        uci -q set "xmodem.${modem_sec}.sim_slot=$slot"
-        uci -q commit xmodem
-        tg_send_retry "⚠️ <b>SIM Switch sent</b>
-
-Target: <b>$slot_name</b>
-Verification unavailable \(modem reconnecting\).
-Check SIM Switch menu after modem is online." \
-            "[[{\"text\":\"🔄 Cek Status\",\"callback_data\":\"menu:simswitch\",\"style\":\"primary\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]]"
-    else
-        tg_send_retry "❌ <b>SIM Switch Failed</b>
-
-Target: $slot_name
-Actual: <b>$actual_name</b> (unchanged)" \
-            "[[{\"text\":\"🔄 Retry\",\"callback_data\":\"menu:simswitch\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"menu:main\"}]]"
-    fi
-}
-
-###############################################################################
-# Callback Query Handler (inline keyboard button taps)
-###############################################################################
-
-handle_callback() {
-    local cb_id="$1" data="$2" cb_chat="$3"
-
-    # Security: only respond to authorized chat (string compare, 64-bit safe)
-    [ -n "$CHAT_ID" ] && [ "$cb_chat" != "$CHAT_ID" ] && return
-
-    case "$data" in
-        # Navigation
-        menu:main)      tg_answer_cb "$cb_id" "Menu"; clear_pending; send_main_menu ;;
-        menu:profiles)  tg_answer_cb "$cb_id" "Loading profiles..."; send_profile_list ;;
-        menu:manage)    tg_answer_cb "$cb_id" "Manage profiles"; send_manage_menu ;;
-        menu:rename)    tg_answer_cb "$cb_id" "Rename"; send_rename_menu ;;
-        menu:download)  tg_answer_cb "$cb_id" "Download"; send_download_prompt ;;
-        menu:notif)     tg_answer_cb "$cb_id" "Notifications"; send_notif_list ;;
-        menu:settings)  tg_answer_cb "$cb_id" "Settings"; send_settings ;;
-        menu:simswitch) tg_answer_cb "$cb_id" "SIM Switch"; send_sim_switch ;;
-        noop)           tg_answer_cb "$cb_id" "Profile aktif (locked)" ;; # locked button
-
-        # Actions
-        act:status)     tg_answer_cb "$cb_id" "Refreshing..."; send_modem_status ;;
-        act:notifprocess) tg_answer_cb "$cb_id" "Processing..."; do_notif_process ;;
-        menu:eid)       tg_answer_cb "$cb_id" "EID Info"; send_eid_info ;;
-
-        # Rename profile (ask for new nickname)
-        ren:*)
-            local iccid="${data#ren:}"
-            tg_answer_cb "$cb_id" "Rename..."
-            save_pending "rename" "$iccid"
-            tg_send_inline "✏️ <b>Rename Profile</b>
-
-ICCID: <code>$iccid</code>
-
-Send new name \(max 64 characters\):" \
-                '[[{"text":"❌ Cancel","callback_data":"cancel","style":"danger"}]]'
-            ;;
-
-        # SIM Slot switch
-        simslot:*)
-            local slot="${data#simslot:}"
-            tg_answer_cb "$cb_id" ""
-            # Ask confirmation before switching SIM slot
-            local modem_sec=$(get_modem_section)
-            local manufacturer=$(uci -q get "xmodem.${modem_sec}.manufacturer")
-            local slot_name="Slot $slot"
-            [ "$manufacturer" = "foxconn" ] && {
-                [ "$slot" = "0" ] && slot_name="SIM Card (physical)"
-                [ "$slot" = "1" ] && slot_name="eSIM"
-            }
-            save_pending "simslot" "$slot"
-            tg_send_inline "⚠️ <b>Confirm SIM Slot Switch</b>
-
-Target: <b>$slot_name</b>
-
-⚠️ Internet will briefly disconnect.
-Continue?" \
-                '[[{"text":"✅ Yes, Switch","callback_data":"confirm:yes","style":"success"},{"text":"❌ Cancel","callback_data":"cancel","style":"danger"}]]'
-            ;;
-
-        # Profile switch (ask confirmation)
-        sw:*)
-            local iccid="${data#sw:}"
-            tg_answer_cb "$cb_id" "Switch profile..."
-            if [ "$ALLOW_DISRUPTIVE" != "1" ]; then
-                tg_send "⛔ Disruptive operations disabled."
-                return
-            fi
-            if [ "$REQUIRE_CONFIRM" = "1" ]; then
-                save_pending "switch" "$iccid"
-                tg_send_inline "⚠️ <b>Confirm Switch Profile</b>
-
-ICCID: <code>$iccid</code>
-
-Internet akan TERPUTUS 30-60 detik.
-Continue?" \
-                    '[[{"text":"✅ Yes, Switch","callback_data":"confirm:yes","style":"success"},{"text":"❌ Cancel","callback_data":"cancel","style":"danger"}]]'
-            else
-                do_switch "$iccid"
-            fi
-            ;;
-
-        # Profile delete (ask confirmation)
-        del:*)
-            local iccid="${data#del:}"
-            tg_answer_cb "$cb_id" "Delete profile..."
-            if [ "$ALLOW_DISRUPTIVE" != "1" ]; then
-                tg_send "⛔ Disruptive operations disabled."
-                return
-            fi
-            save_pending "delete" "$iccid"
-            tg_send_inline "🗑 <b>Confirm Delete Profile</b>
-
-ICCID: <code>$iccid</code>
-
-⚠️ Profile will be permanently deleted!
-Continue?" \
-                '[[{"text":"🗑 Yes, Delete","callback_data":"confirm:yes","style":"danger"},{"text":"❌ Cancel","callback_data":"cancel"}]]'
-            ;;
-
-        # Confirmation
-        confirm:yes)
-            tg_answer_cb "$cb_id" "Executing..."
-            if load_pending; then
-                case "$PEND_ACTION" in
-                    switch)   do_switch "$PEND_ARG" ;;
-                    delete)   do_delete "$PEND_ARG" ;;
-                    download) do_download "$PEND_ARG" ;;
-                    simslot)  do_simslot "$PEND_ARG" ;;
-                esac
-                clear_pending
-            else
-                tg_send "⚠️ No pending operation."
-            fi
-            ;;
-
-        cancel)
-            tg_answer_cb "$cb_id" "DiCancelkan"
-            clear_pending
-            tg_send_inline "❌ Cancelled." \
-                '[[{"text":"📋 Profile List","callback_data":"menu:profiles"},{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-            ;;
-
-        # Settings toggles
-        cfg:backend:*)
-            local be="${data#cfg:backend:}"
-            tg_answer_cb "$cb_id" "Backend: $be"
-            uci -q set lpac-esim.main.apdu_backend="$be"
-            uci -q commit lpac-esim
-            send_settings
-            ;;
-        cfg:toggle:*)
-            local key="${data#cfg:toggle:}"
-            local cur=$(uci -q get "lpac-esim.main.$key" || echo "0")
-            local new=$([ "$cur" = "1" ] && echo "0" || echo "1")
-            tg_answer_cb "$cb_id" "$key: $([ "$new" = "1" ] && echo ON || echo OFF)"
-            uci -q set "lpac-esim.main.$key=$new"
-            uci -q commit lpac-esim
-            send_settings
-            ;;
-    esac
-}
-
-###############################################################################
-# Text Message Handler
-###############################################################################
-
-handle_message() {
-    local chat="$1" text="$2"
-
-    # Security: string compare (64-bit safe on 32-bit ARM)
-    [ -n "$CHAT_ID" ] && [ "$chat" != "$CHAT_ID" ] && {
-        # Only respond to /chatid for unauthorized users
-        case "$text" in /chatid|/start)
-            local payload
-            payload=$(jq -nc --arg c "$chat" --arg t "Your Chat ID: $chat" \
-                '{chat_id:$c, text:$t}')
-            tg_post "sendMessage" "$payload" >/dev/null
-        esac
-        return
-    }
-
-    # Check if we're waiting for input (download LPA string)
-    if load_pending && [ "$PEND_ACTION" = "download" ] && [ -z "$PEND_ARG" ]; then
-        case "$text" in
-            LPA:1\$*|lpa:1\$*)
-                save_pending "download" "$text"
-                tg_send_inline "📥 Download ini?" \
-                    '[[{"text":"✅ Ya","callback_data":"confirm:yes"},{"text":"❌ Cancel","callback_data":"cancel"}]]'
-                ;;
-            /cancel)
-                clear_pending
-                send_main_menu
-                ;;
-            *)
-                tg_send "⚠️ Format: <code>LPA:1\$server\$matchingId</code>"
-                ;;
-        esac
-        return
-    fi
-
-    # Check if we're waiting for rename input
-    if load_pending && [ "$PEND_ACTION" = "rename" ] && [ -n "$PEND_ARG" ]; then
-        local new_name="$text"
-        local iccid="$PEND_ARG"
-        if [ "$new_name" = "/cancel" ]; then
-            clear_pending; send_main_menu; return
-        fi
-        if [ ${#new_name} -gt 64 ]; then
-            tg_send "⚠️ Max 64 karakter. Try Again:"; return
-        fi
-        if [ ${#new_name} -lt 1 ]; then
-            tg_send "⚠️ Name cannot be empty."; return
-        fi
-        clear_pending
-        tg_send "⏳"
-        local result
-        result=$(lpac_api nickname "$iccid" --nickname "$new_name")
-        local rcode=$(echo "$result" | jq -r '.payload.code // 99')
-        if [ "$rcode" = "0" ]; then
-            tg_send_inline "✅ <b>Renamed</b>
-
-→ <b>$new_name</b>" \
-                '[[{"text":"📋 Profiles","callback_data":"menu:profiles","style":"primary"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        else
-            local err=$(echo "$result" | jq -r '.payload.message // "Unknown"')
-            tg_send_inline "❌ Rename failed: $err" \
-                '[[{"text":"✏️ Retry","callback_data":"menu:rename"}],[{"text":"🏠 Menu","callback_data":"menu:main"}]]'
-        fi
-        return
-    fi
-
-    # Match full text first (keyboard buttons + slash commands)
-    case "$text" in
-        # Keyboard buttons (exact match including emoji)
-        "📱 Info EID")       send_eid_info ;;
-        "📋 Profile List")   send_profile_list ;;
-        "📥 Download eSIM")  send_download_prompt ;;
-        "🔔 Notifications")  send_notif_list ;;
-        "📡 Modem Status")   send_modem_status ;;
-        "⚙️ Settings")       send_settings ;;
-        "❓ Help")           tg_send "📋 <b>XModem eSIM Bot v${APP_VER}</b>
-
-<b>Menu Buttons:</b>
-📱 Info EID — eUICC chip info, storage, EID
-📋 Profile List — switch/manage eSIM profiles
-📥 Download — download new eSIM profile
-🔔 Notifications — process pending notifications
-📡 Modem Status — signal, operator, band, temperature
-⚙️ Settings — toggle backend/proxy/debug
-
-<b>Commands:</b>
-/eid — Full eUICC chip information
-/profiles — Profile list with switch buttons
-/status — Modem status &amp; signal details
-/download &lt;LPA&gt; — Download new profile
-/enable &lt;ICCID&gt; — Switch to another profile
-/delete &lt;ICCID&gt; — Delete profile (permanent)
-/notif — Process eSIM notifications
-/settings — lpac backend settings
-/chatid — Show your Chat ID
-
-<b>Manage (via buttons):</b>
-⚡ Manage Profile — delete/rename profiles
-🔄 SIM Switch — switch between SIM card and eSIM
-✏️ Rename — change profile nickname" ;;
-        "🏠 Menu"|"Menu Utama"|"Menu") send_main_menu ;;
-
-        # Slash commands
-        /start|/menu)       send_main_menu ;;
-        /help)              tg_send "📋 <b>Commands</b>
-
-/eid - eUICC chip info
-/profiles - Profile list with buttons
-/status - Modem status &amp; signal
-/download &lt;LPA&gt; - Download profile
-/enable &lt;ICCID&gt; - Switch profile
-/delete &lt;ICCID&gt; - Delete profile
-/notif - Process notifications
-/settings - Backend settings
-/chatid - Show Chat ID
-/cancel - Cancel current operation" ;;
-        /chatid)            tg_send "Chat ID: <code>$chat</code>" ;;
-        /eid|/info)         send_eid_info ;;
-        /profiles|/profile) send_profile_list ;;
-        /status)            send_modem_status ;;
-        /settings)          send_settings ;;
-        /notif)             do_notif_process ;;
-        /cancel)            clear_pending; send_main_menu ;;
-        /download\ *)
-            local arg="${text#/download }"
-            case "$arg" in LPA:1\$*|lpa:1\$*)
-                save_pending "download" "$arg"
-                tg_send_inline "📥 Download ini?" \
-                    '[[{"text":"✅ Ya","callback_data":"confirm:yes"},{"text":"❌ Cancel","callback_data":"cancel"}]]'
-                ;; *)
-                tg_send "⚠️ Format: /download LPA:1\$server\$matchingId"
-                ;; esac
-            ;;
-        /download)          send_download_prompt ;;
-        /enable\ *|/switch\ *)
-            local arg="${text#/enable }"
-            [ "$arg" = "$text" ] && arg="${text#/switch }"
-            [ -z "$arg" ] && { tg_send "⚠️ Format: /enable &lt;ICCID&gt;"; return; }
-            if [ "$REQUIRE_CONFIRM" = "1" ]; then
-                save_pending "switch" "$arg"
-                tg_send_inline "⚠️ Switch ke <code>$arg</code>?" \
-                    '[[{"text":"✅ Ya","callback_data":"confirm:yes"},{"text":"❌ Cancel","callback_data":"cancel"}]]'
-            else
-                do_switch "$arg"
-            fi ;;
-        /enable|/switch)    tg_send "⚠️ Format: /enable &lt;ICCID&gt;" ;;
-        /delete\ *)
-            local arg="${text#/delete }"
-            [ -z "$arg" ] && { tg_send "⚠️ Format: /delete &lt;ICCID&gt;"; return; }
-            save_pending "delete" "$arg"
-            tg_send_inline "🗑 Delete <code>$arg</code>?" \
-                '[[{"text":"🗑 Ya","callback_data":"confirm:yes"},{"text":"❌ Cancel","callback_data":"cancel"}]]'
-            ;;
-        /delete)            tg_send "⚠️ Format: /delete &lt;ICCID&gt;" ;;
-
-        # Unknown: show menu
-        *)  send_main_menu ;;
-    esac
-}
-
-###############################################################################
-# Update Processor
-###############################################################################
-
-process_update() {
-    local update="$1"
-
-    # Callback query (inline button tap)
-    local cb_id cb_data cb_chat
-    cb_id=$(echo "$update" | jq -r '.callback_query.id // empty')
-    if [ -n "$cb_id" ]; then
-        cb_data=$(echo "$update" | jq -r '.callback_query.data // empty')
-        cb_chat=$(echo "$update" | jq -r '.callback_query.message.chat.id | tostring')
-        handle_callback "$cb_id" "$cb_data" "$cb_chat"
-        return
-    fi
-
-    # Text message
-    local msg_chat msg_text
-    msg_chat=$(echo "$update" | jq -r '.message.chat.id | tostring')
-    msg_text=$(echo "$update" | jq -r '.message.text // empty')
-    [ -z "$msg_text" ] && return
-
-    handle_message "$msg_chat" "$msg_text"
-}
-
-###############################################################################
-# Main Loop
-###############################################################################
-
-cleanup() {
-    save_offset
-    write_status "stopped" 0
-    rm -f "$PID_FILE"
-    log_msg "stopped"
-    exit 0
-}
-
-main() {
-    mkdir -p "$STATE_DIR"
-    load_config || exit 1
-    TG_API="https://api.telegram.org/bot${BOT_TOKEN}"
-    load_offset
-    echo $$ > "$PID_FILE"
-    trap cleanup INT TERM
-
-    log_msg "Bot started (poll=${POLL_INTERVAL}s, chat_id=${CHAT_ID})"
-    write_status "starting" 0
-
-    local consecutive_fail=0
-
-    while true; do
-        local offset=$((LAST_UPDATE_ID + 1))
-        local response
-
-        response=$(curl -s -m $((POLL_TIMEOUT + 10)) \
-            "${TG_API}/getUpdates?offset=${offset}&timeout=${POLL_TIMEOUT}&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D" \
-            2>/dev/null)
-
-        if [ -z "$response" ]; then
-            consecutive_fail=$((consecutive_fail + 1))
-            write_status "error" "$consecutive_fail"
-            [ $((consecutive_fail % 10)) -eq 1 ] && log_msg "getUpdates empty (fail=$consecutive_fail)"
-            sleep 10
-            continue
-        fi
-
-        local ok
-        ok=$(echo "$response" | jq -r '.ok')
-        if [ "$ok" != "true" ]; then
-            consecutive_fail=$((consecutive_fail + 1))
-            write_status "error" "$consecutive_fail"
-            [ $((consecutive_fail % 10)) -eq 1 ] && log_msg "API error: $(echo "$response" | jq -r '.description // "?"')"
-            sleep 10
-            continue
-        fi
-
-        consecutive_fail=0
-        write_status "ok" 0
-
-        # Process updates
-        local count
-        count=$(echo "$response" | jq '.result | length')
-        if [ -n "$count" ] && [ "$count" -gt 0 ]; then
-            local idx=0
-            while [ $idx -lt "$count" ]; do
-                local update uid
-                update=$(echo "$response" | jq ".result[$idx]")
-                uid=$(echo "$update" | jq -r '.update_id')
-                [ "$uid" -gt "$LAST_UPDATE_ID" ] && {
-                    LAST_UPDATE_ID=$uid
-                    process_update "$update"
-                }
-                idx=$((idx + 1))
-            done
-            save_offset
-        fi
-
-        sleep "$POLL_INTERVAL"
-    done
-}
-
-main "$@"
+main();

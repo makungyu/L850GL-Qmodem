@@ -62,7 +62,6 @@ lpac-esim                     # interactive TUI menu
 | `jq` | JSON parsing |
 | `curl` / `libcurl` | HTTP for SM-DP+ communication |
 | `luci-base` | LuCI framework |
-| `luci-compat` | Lua compatibility (OpenWrt 25.x) |
 
 ## Installation
 
@@ -103,9 +102,9 @@ For XModem users, this works out-of-box. The web UI Configuration tab allows cha
 ## Architecture
 
 ```
-Browser → LuCI → lpac_esim.lua → lpac-esim --api → lpac binary → eUICC
-                                       ↓
-                              mbim-proxy (shared with quectel-CM)
+Browser → LuCI JS → rpcd (ubus) → lpac-esim --api → lpac binary → eUICC
+                                            ↓
+                                   mbim-proxy (shared with quectel-CM)
 ```
 
 ## Credits

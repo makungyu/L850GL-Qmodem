@@ -3,6 +3,13 @@
     "description": "LuCI WebUI for eSIM management via lpac-esim backend",
     "read": {
       "uci": ["lpac-esim", "xmodem_esim_bot"],
+      "ubus": {
+        "lpac_esim": [
+          "chip", "profiles", "modem_status", "notif_list",
+          "lock_status", "version", "config", "telegram_config",
+          "telegram_status", "connectivity"
+        ]
+      },
       "file": {
         "/usr/bin/lpac-esim": ["exec"],
         "/usr/bin/lpac":          ["exec"],
@@ -12,7 +19,14 @@
       }
     },
     "write": {
-      "uci": ["lpac-esim", "xmodem_esim_bot"]
+      "uci": ["lpac-esim", "xmodem_esim_bot"],
+      "ubus": {
+        "lpac_esim": [
+          "switch", "reboot_modem", "notif_clear", "download",
+          "delete", "nickname", "notif_process", "save_config",
+          "save_telegram_config", "test_telegram", "telegram_toggle"
+        ]
+      }
     }
   }
 }

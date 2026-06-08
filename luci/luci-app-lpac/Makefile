@@ -15,7 +15,7 @@ define Package/$(PKG_NAME)
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI eSIM Profile Manager (lpac)
-  DEPENDS:=+luci-base +luci-compat +luci-app-xmodem-next +lpac +jq +libmbim
+  DEPENDS:=+luci-base +luci-app-xmodem-next +lpac +jq +libmbim
   URL:=https://github.com/mkuruyuk/XModem
 endef
 
@@ -41,13 +41,9 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./src/usr/bin/lpac-esim $(1)/usr/bin/lpac-esim
 
-	# LuCI controller (use src/ version - newer v1.3.5)
-	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/controller
-	$(INSTALL_DATA) ./src/usr/lib/lua/luci/controller/lpac_esim.lua $(1)/usr/lib/lua/luci/controller/lpac_esim.lua
-
-	# LuCI views (use src/ version - newer with diagnostics tab)
-	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/view/lpac_esim
-	$(CP) ./src/usr/lib/lua/luci/view/lpac_esim/*.htm $(1)/usr/lib/lua/luci/view/lpac_esim/
+	# RPCD backend
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(INSTALL_BIN) ./root/usr/libexec/rpcd/lpac_esim $(1)/usr/libexec/rpcd/lpac_esim
 
 	# Static web assets (JS, CSS)
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/lpac-esim
