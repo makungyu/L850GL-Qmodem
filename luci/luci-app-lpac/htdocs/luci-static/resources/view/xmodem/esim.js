@@ -19,7 +19,15 @@ return view.extend({
 		var container = E('div', { 'class': 'cbi-map' });
 
 		// Header
-		container.appendChild(E('h2', {}, _('eSIM Manager')));
+		container.appendChild(E('h2', {}, [
+			_('eSIM Manager'),
+			' ',
+			E('span', {
+				'id': 'esim-connectivity-status',
+				'title': _('Checking internet connection...'),
+				'style': 'font-size: 18px; vertical-align: middle;'
+			}, '🟡')
+		]));
 		container.appendChild(E('div', { 'class': 'cbi-map-descr' },
 			[ _('Manage eSIM profiles via lpac. Supports profile list, switch, download, and delete.'), ' ', E('span', { 'id': 'esim-app-version' }, '') ]));
 
@@ -43,16 +51,6 @@ return view.extend({
 			tabMenu.appendChild(li);
 		});
 		container.appendChild(tabMenu);
-
-		// Connectivity banner
-		var bannerDiv = E('div', { 'id': 'esim-connectivity-banner', 'style': 'margin-bottom: 20px;' });
-		bannerDiv.appendChild(E('div', { 'id': 'connectivity-checking', 'style': 'padding: 10px; border: 1px solid #ffc107; background: #fff3cd; border-radius: 4px; color: #856404;' },
-			E('strong', {}, _('Checking internet connection...'))));
-		bannerDiv.appendChild(E('div', { 'id': 'connectivity-online', 'style': 'display: none; padding: 10px; border: 1px solid #28a745; background: #d4edda; border-radius: 4px; color: #155724;' },
-			[ E('strong', {}, _('Internet connection available')), ' — ', _('You can manage eSIM profiles') ]));
-		bannerDiv.appendChild(E('div', { 'id': 'connectivity-offline', 'style': 'display: none; padding: 10px; border: 1px solid #dc3545; background: #f8d7da; border-radius: 4px; color: #721c24;' },
-			[ E('strong', {}, _('No internet connection')), ' — ', _('Local management (switch, reboot) works offline.') ]));
-		container.appendChild(bannerDiv);
 
 		// Lock banner
 		container.appendChild(E('div', { 'id': 'esim-lock-banner', 'style': 'display: none; margin-bottom: 20px; padding: 10px; border: 1px solid #17a2b8; background: #d1ecf1; border-radius: 4px; color: #0c5460;' },
@@ -257,29 +255,30 @@ function loadEsimModules() {
 
 function checkConnectivity() {
 	if (typeof window.apiGet !== 'function') return;
-	var checking = document.getElementById('connectivity-checking');
-	var online = document.getElementById('connectivity-online');
-	var offline = document.getElementById('connectivity-offline');
+	var status = document.getElementById('esim-connectivity-status');
+
+	if (status) {
+		status.textContent = '🟡';
+		status.title = _('Checking internet connection...');
+	}
 
 	window.apiGet('connectivity')
 		.then(function(data) {
-			if (checking) checking.style.display = 'none';
 			// Handle response formats from rpcd or lpac-esim
 			var isOnline = false;
 			if (data && data.connected) isOnline = true;
 			if (data && data.success && data.connected) isOnline = true;
 			if (data && data.payload && data.payload.data && data.payload.data.online) isOnline = true;
 
-			if (isOnline) {
-				if (online) online.style.display = 'block';
-				if (offline) offline.style.display = 'none';
-			} else {
-				if (online) online.style.display = 'none';
-				if (offline) offline.style.display = 'block';
+			if (status) {
+				status.textContent = isOnline ? '🟢' : '🔴';
+				status.title = isOnline ? _('Internet connected') : _('Internet disconnected');
 			}
 		})
 		.catch(function() {
-			if (checking) checking.style.display = 'none';
-			if (offline) offline.style.display = 'block';
+			if (status) {
+				status.textContent = '🔴';
+				status.title = _('Internet disconnected');
+			}
 		});
 }
