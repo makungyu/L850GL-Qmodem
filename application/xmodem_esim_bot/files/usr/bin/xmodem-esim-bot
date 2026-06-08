@@ -3,7 +3,7 @@
 import * as fs from 'fs';
 
 const APP_NAME = "xmodem-esim-bot";
-const APP_VER = "3.2.0 (Ucode)";
+const APP_VER = "2.0.0";
 const STATE_DIR = "/tmp/lpac-esim";
 const OFFSET_FILE = `${STATE_DIR}/telegram.offset`;
 const STATUS_FILE = `${STATE_DIR}/telegram.status`;
@@ -109,7 +109,10 @@ function send_main_menu() {
 	});
 }
 function ui_help() {
-	tg_send(`📋 <b>XModem eSIM Bot v${APP_VER}</b>\n\n<b>Menu Buttons:</b>\n📱 Info EID — eUICC chip info, storage, EID\n📋 Profile List — switch/manage eSIM profiles\n📥 Download — download new eSIM profile\n🔔 Notifications — process pending notifications\n📡 Modem Status — signal, operator, band, temperature\n⚙️ Settings — toggle backend/proxy/debug\n\n<b>Commands:</b>\n/eid — Full eUICC chip information\n/profiles — Profile list with switch buttons\n/status — Modem status &amp; signal details\n/download &lt;LPA&gt; — Download new profile\n/enable &lt;ICCID&gt; — Switch profile\n/delete &lt;ICCID&gt; — Delete profile\n/notif — Process eSIM notifications\n/settings — lpac backend settings\n/chatid — Show your Chat ID\n/cancel — Cancel current operation`);
+	tg_send(`📋 <b>XModem eSIM Bot v${APP_VER}</b>\n\n<b>Menu Buttons:</b>\n📱 Info EID — eUICC chip info, storage, EID\n📋 Profile List — switch/manage eSIM profiles\n📥 Download — download new eSIM profile\n🔔 Notifications — process pending notifications\n📡 Modem Status — signal, operator, band, temperature\n⚙️ Settings — toggle backend/proxy/debug\n\n<b>Commands:</b>\n/eid — Full eUICC chip information\n/profiles — Profile list with switch buttons\n/status — Modem status &amp; signal details\n/download &lt;LPA&gt; — Download new profile\n/enable &lt;ICCID&gt; — Switch to another profile\n/delete &lt;ICCID&gt; — Delete profile (permanent)\n/notif — Process eSIM notifications\n/settings — lpac backend settings\n/chatid — Show your Chat ID\n\n<b>Manage (via buttons):</b>\n⚡ Manage Profile — delete/rename profiles\n🔄 SIM Switch — switch between SIM card and eSIM\n✏️ Rename — change profile nickname`);
+}
+function ui_help_short() {
+	tg_send(`📋 <b>Commands</b>\n\n/eid - eUICC chip info\n/profiles - Profile list with buttons\n/status - Modem status &amp; signal\n/download &lt;LPA&gt; - Download profile\n/enable &lt;ICCID&gt; - Switch profile\n/delete &lt;ICCID&gt; - Delete profile\n/notif - Process notifications\n/settings - Backend settings\n/chatid - Show Chat ID\n/cancel - Cancel current operation`);
 }
 
 function get_modem_section() { return trim(sys(`uci show xmodem 2>/dev/null | grep '=modem-device' | head -n1 | cut -d. -f2 | cut -d= -f1`)); }
@@ -165,7 +168,7 @@ function get_current_slot(section) {
 }
 
 function ui_eid(msg_id) {
-	msg_id = update_ui(msg_id, "⏳ <b>Membaca eUICC...</b>");
+	msg_id = update_ui(msg_id, "⏳");
 	let chip = lpac_api("chip");
 	let profiles = lpac_api("profiles");
 	if (!chip.success) return update_ui(msg_id, `❌ <b>Gagal membaca EID</b>\n${html(chip.error || chip.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
@@ -187,20 +190,19 @@ function ui_eid(msg_id) {
 function profile_name(p) { return p.profileNickname || p.profileName || p.serviceProviderName || "Unknown"; }
 function profile_active(p) { return p.profileState == "enabled" || p.state == "enabled"; }
 function ui_profiles(msg_id) {
-	msg_id = update_ui(msg_id, "⏳ <b>Membaca profile...</b>");
+	msg_id = update_ui(msg_id, "⏳");
 	let res = lpac_api("profiles");
 	if (!res.success) return update_ui(msg_id, `❌ <b>Gagal membaca profiles</b>\n${html(res.error || res.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
 	let p = res.data || [];
 	if (length(p) == 0) return update_ui(msg_id, "📋 No profiles.", {inline_keyboard: [[{text: "📥 Download eSIM", callback_data: "menu:download", style: "success"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
-	let text = `📋 <b>eSIM Profiles</b> (${length(p)})\n\n`;
+	let text = `📋 <b>Profiles</b> (${length(p)})`;
 	let active_rows = [], inactive_buttons = [];
 	for (let i = 0; i < length(p); i++) {
 		let n = profile_name(p[i]);
 		let iccid = `${p[i].iccid || ""}`;
 		let active = profile_active(p[i]);
-		text += `${active ? "✅" : "▫️"} <b>${html(n)}</b>\nICCID: <code>${html(iccid)}</code>\nProvider: ${html(p[i].serviceProviderName || "-")}\nStatus: ${active ? "<b>ACTIVE</b>" : "Inactive"}\n\n`;
-		if (active) active_rows[length(active_rows)] = [{text: `🔒 ${btn_label(n)}`, callback_data: "noop", style: "primary"}];
-		else inactive_buttons[length(inactive_buttons)] = {text: `⚡ ${btn_label(n)}`, callback_data: `sw:${iccid}`, style: "danger"};
+		if (active) active_rows[length(active_rows)] = [{text: `Aktif • ${btn_label(n)} 🔒`, callback_data: "noop", style: "primary"}];
+		else inactive_buttons[length(inactive_buttons)] = {text: btn_label(n), callback_data: `sw:${iccid}`, style: "danger"};
 	}
 	let kb = [];
 	for (let i = 0; i < length(active_rows); i++) kb[length(kb)] = active_rows[i];
@@ -216,7 +218,7 @@ function ui_profiles(msg_id) {
 }
 
 function ui_manage(msg_id) {
-	msg_id = update_ui(msg_id, "⏳ <b>Memuat manage profile...</b>");
+	msg_id = update_ui(msg_id, "⏳");
 	let res = lpac_api("profiles");
 	if (!res.success) return update_ui(msg_id, `❌ <b>Gagal</b>\n${html(res.error || res.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
 	let p = res.data || [], kb = [], del_buttons = [];
@@ -242,7 +244,7 @@ function ui_manage(msg_id) {
 }
 
 function ui_rename_menu(msg_id) {
-	msg_id = update_ui(msg_id, "⏳ <b>Memuat rename menu...</b>");
+	msg_id = update_ui(msg_id, "⏳");
 	let res = lpac_api("profiles");
 	if (!res.success) return update_ui(msg_id, `❌ <b>Gagal</b>\n${html(res.error || res.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
 	let p = res.data || [], kb = [], buttons = [];
@@ -258,19 +260,24 @@ function ui_rename_menu(msg_id) {
 
 function ui_download_prompt(msg_id) {
 	clear_pending(); set_pending("download", "");
-	update_ui(msg_id, "📥 <b>Download eSIM</b>\n\nKirim LPA string dengan format:\n<code>LPA:1$server$matchingId</code>\n\nKirim /cancel untuk batal.", {inline_keyboard: [[{text: "❌ Cancel", callback_data: "cancel", style: "danger"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
+	update_ui(msg_id, "📥 <b>Download eSIM</b>
+
+Send activation code in format:
+<code>LPA:1$smdp.example.com$MATCHING-ID</code>
+
+Or tap Cancel.", {inline_keyboard: [[{text: "❌ Cancel", callback_data: "cancel"}]]});
 }
 
 function ui_notif(msg_id) {
-	msg_id = update_ui(msg_id, "⏳ <b>Membaca notifikasi...</b>");
+	msg_id = update_ui(msg_id, "⏳");
 	let r = lpac_api("notif_list");
 	if (!r.success) return update_ui(msg_id, "❌ Failed to read notifications.", {inline_keyboard: INLINE_MENU});
 	let list = r.data || [];
-	if (length(list) == 0) return update_ui(msg_id, "🔔 <b>Notifications</b>\n\nNo pending eUICC notifications.", {inline_keyboard: INLINE_MENU});
-	update_ui(msg_id, `🔔 <b>Notifications</b>\n\nPending: <b>${length(list)}</b> messages.`, {inline_keyboard: [[{text: "⚡ Process All", callback_data: "act:notifprocess"}, {text: "🏠 Menu", callback_data: "menu:main"}]]});
+	update_ui(msg_id, `🔔 Pending: ${length(list)}`, {inline_keyboard: [[{text: "⚡ Process All", callback_data: "act:notifprocess"}, {text: "🏠 Menu", callback_data: "menu:main"}]]});
 }
 
 function signal_bar(percent) { percent = safe_int(percent, 0); if (percent >= 80) return "▰▰▰▰▰"; if (percent >= 60) return "▰▰▰▰▱"; if (percent >= 40) return "▰▰▰▱▱"; if (percent >= 20) return "▰▰▱▱▱"; if (percent > 0) return "▰▱▱▱▱"; return "▱▱▱▱▱"; }
+function legacy_signal_bar(percent) { percent = safe_int(percent, -1); if (percent >= 80) return "▁▃▅▇█"; if (percent >= 60) return "▁▃▅▇░"; if (percent >= 40) return "▁▃▅░░"; if (percent >= 20) return "▁▃░░░"; if (percent >= 0) return "▁░░░░"; return "░░░░░"; }
 function reg_text(cereg) {
 	let m = match(cereg || "", /\+CEREG:\s*[0-9]+,\s*([0-9]+)/);
 	if (!m) return cereg || "-";
@@ -297,7 +304,106 @@ function parse_debug(debug) {
 	return out;
 }
 function ui_modem(msg_id) {
-	update_ui(msg_id, "📡 <b>Modem Status</b>\n\nFitur ini dinonaktifkan sementara karena query modem berat bisa membuat bot mengirim loading berulang.\n\nGunakan LuCI XModem untuk melihat status modem sampai parser Telegram dibuat ulang dengan aman.", {inline_keyboard: INLINE_MENU});
+	msg_id = update_ui(msg_id, "⏳");
+	let section = get_modem_section();
+	let at_port = section ? modem_get(section, "at_port", "") : "";
+	let manufacturer = section ? modem_get(section, "manufacturer", "") : "";
+	if (!at_port || system(`test -e ${sh_quote(at_port)}`) != 0 || system("test -x /usr/bin/sms_tool_q") != 0)
+		return update_ui(msg_id, "❌ AT port not available.", {inline_keyboard: INLINE_MENU});
+
+	let bi = ubus_xmodem("base_info", section) || {};
+	let ni = ubus_xmodem("network_info", section) || {};
+	let ci = ubus_xmodem("cell_info", section) || {};
+	let model = "-", fw = "-", imei = "-", op = "-", tech = "-", state = "-";
+	let sig_pct = "-", sig_dbm = "-", temp = "-";
+	let rsrp = "-", rsrq = "-", rssi = "-", sinr = "-";
+	let pband = "-", pci = "-", earfcn = "-", ca_bands = "";
+
+	let mfr = info_value(bi, "manufacturer", "");
+	let mdl = info_value(bi, "name", "");
+	if (!mfr && !mdl) {
+		mfr = trim(sys(`sms_tool_q -d ${sh_quote(at_port)} at 'AT+CGMI' 2>/dev/null | grep -v '^AT\|^OK\|^$' | head -1 | sed 's/^+CGMI: *//;s/"//g' | tr -d '\r'`));
+		mdl = trim(sys(`sms_tool_q -d ${sh_quote(at_port)} at 'AT+CGMM' 2>/dev/null | grep -v '^AT\|^OK\|^$' | head -1 | sed 's/^+CGMM: *//;s/"//g;s/,.*//' | tr -d '\r'`));
+	}
+	model = trim(`${mfr} ${mdl}`) || "-";
+	fw = info_value(bi, "revision", "");
+	if (!fw) fw = trim(sys(`sms_tool_q -d ${sh_quote(at_port)} at 'AT+CGMR' 2>/dev/null | grep -v '^AT\|^OK\|^$' | head -1 | sed 's/^+CGMR: *//;s/"//g' | tr -d '\r'`));
+	fw = fw || "-";
+
+	let resp = at_cmd(at_port, "AT+CGSN");
+	let m = match(resp, /([0-9]{15})/); if (m) imei = m[1];
+
+	resp = at_cmd(at_port, "AT+COPS?");
+	if (match(resp, /\+COPS:/)) {
+		m = match(resp, /"([^"]*)"/); if (m) op = m[1];
+		if (op == "-") { m = match(resp, /\+COPS:[^,]*,[^,]*,([^,]*)/); if (m) op = replace(m[1], '"', ""); }
+		m = match(resp, /,([0-9]+)$/); if (m) {
+			let act = `${m[1]}`;
+			if (act == "7") tech = "LTE"; else if (act == "12") tech = "NR 5G"; else if (act == "13") tech = "5G NSA"; else if (act == "0") tech = "GSM"; else if (act == "2") tech = "UTRAN"; else if (act == "6") tech = "HSPA+";
+		}
+	}
+	let nt = info_value(ni, "Network Type", ""); if (nt) tech = nt;
+
+	resp = at_cmd(at_port, "AT+CSQ");
+	m = match(resp, /\+CSQ:\s*([0-9]+)/); if (m && `${m[1]}` != "99") { let csq = safe_int(m[1], 0); sig_dbm = `${csq * 2 - 113}`; sig_pct = `${csq * 100 / 31}`; if (safe_int(sig_pct, 0) > 100) sig_pct = "100"; }
+	resp = at_cmd(at_port, "AT+CEREG?");
+	m = match(resp, /\+CEREG:\s*[0-9]+,\s*([0-9]+)/); if (m) { let reg = `${m[1]}`; if (reg == "1") state = "Registered (Home)"; else if (reg == "5") state = "Roaming"; else if (reg == "2") state = "Searching"; else if (reg == "3") state = "Denied"; else if (reg == "0") state = "Not registered"; }
+
+	resp = at_cmd(at_port, "AT^TEMP?");
+	if (match(resp, /TSENS|PA|Skin/i)) {
+		m = match(resp, /TSENS[^0-9-]*(-?[0-9]+)/); if (m) temp = `${m[1]}°C`;
+		let p = match(resp, /PA[^0-9-]*(-?[0-9]+)/); if (p && (!m || safe_int(p[1], -999) > safe_int(m[1], -999))) temp = `${p[1]}°C`;
+	}
+
+	let v;
+	v = info_value(ci, "Band", ""); if (v) pband = `B${v}`;
+	v = info_value(ci, "DL Bandwidth", ""); if (pband != "-" && v) pband = `${pband} @${v}MHz`;
+	v = info_value(ci, "Physical Cell ID", ""); if (v) pci = v;
+	v = info_value(ci, "EARFCN", ""); if (v) earfcn = v;
+	v = info_value(ci, "RSRP", ""); if (v) rsrp = `${v}dBm`;
+	v = info_value(ci, "RSRQ", ""); if (v) rsrq = `${v}dB`;
+	v = info_value(ci, "RSSI", ""); if (v) rssi = `${v}dBm`;
+	v = info_value(ci, "SINR", ""); if (v) sinr = `${v}dB`;
+	v = info_value(ci, "NR Band", ""); if (v) ca_bands = `n${v}`;
+
+	if (pband == "-" && rsrp == "-") {
+		resp = at_cmd(at_port, "AT^DEBUG?");
+		if (match(resp, /pcell|lte_rsrp/i)) {
+			if (match(resp, /scell:/)) tech = "LTE-A";
+			if (match(resp, /nr_band:/)) tech = "5G NSA";
+			let pcell = trim(sys(`printf %s ${sh_quote(resp)} | grep '^pcell:' | head -1`));
+			m = match(pcell, /lte_band:([0-9]+)/); if (m) pband = `B${m[1]}`;
+			m = match(pcell, /lte_band_width:([0-9.]*MHz)/); if (m) pband = `${pband} @${m[1]}`;
+			let chan = trim(sys(`printf %s ${sh_quote(resp)} | grep -A1 '^pcell:' | grep 'channel:' | head -1`));
+			m = match(chan, /pci:([0-9]+)/); if (m) pci = m[1];
+			m = match(chan, /channel:([0-9]+)/); if (m) earfcn = m[1];
+			let rs = trim(sys(`printf %s ${sh_quote(resp)} | grep -A2 '^pcell:' | grep 'lte_rsrp:' | head -1`));
+			m = match(rs, /lte_rsrp:([^,]*)/); if (m) rsrp = m[1];
+			m = match(rs, /rsrq:([^,]*)/); if (m) rsrq = m[1];
+			let ri = trim(sys(`printf %s ${sh_quote(resp)} | grep -A3 '^pcell:' | grep 'lte_rssi:' | head -1`));
+			m = match(ri, /lte_rssi:([^,]*)/); if (m) rssi = m[1];
+			m = match(ri, /lte_snr:([^,]*)/); if (m) sinr = m[1] == "NA" ? "-" : m[1];
+			ca_bands = trim(sys(`printf %s ${sh_quote(resp)} | grep '^scell:' | grep -o 'lte_band:[0-9]*' | cut -d: -f2 | awk '{printf "B%s+", $1}' | sed 's/+$//'`)) || ca_bands;
+		}
+	}
+
+	let bar = legacy_signal_bar(sig_pct);
+	let text = `📡 <b>Modem Status</b>\n\n<b>Signal:</b> ${bar} ${html(sig_pct)}% (${html(sig_dbm)} dBm)\n<b>Operator:</b> ${html(op)}\n<b>Technology:</b> ${html(tech)}\n<b>State:</b> ${html(state)}`;
+	if (pband != "-") text += `\n<b>Band:</b> ${html(pband)}`;
+	if (ca_bands) text += ` + ${html(ca_bands)}`;
+	if (pci != "-" && pci) text += `\n<b>PCI:</b> ${html(pci)} | <b>EARFCN:</b> ${html(earfcn)}`;
+	if (rsrp != "-" || rssi != "-") {
+		text += "\n\n📶 <b>Signal Detail:</b>";
+		if (rsrp != "-") text += `\n  RSRP: <code>${html(rsrp)}</code>`;
+		if (rsrq != "-") text += ` | RSRQ: <code>${html(rsrq)}</code>`;
+		if (rssi != "-") text += `\n  RSSI: <code>${html(rssi)}</code>`;
+		if (sinr != "-") text += ` | SINR: <code>${html(sinr)}</code>`;
+	}
+	text += `\n\n📋 <b>Modem:</b> <code>${html(model)}</code>`;
+	if (fw != "-" && fw) text += `\n<b>FW:</b> <code>${html(fw)}</code>`;
+	if (temp != "-") text += ` | <b>Temp:</b> ${html(temp)}`;
+	if (imei != "-") text += `\n<b>IMEI:</b> <code>${html(imei)}</code>`;
+	update_ui(msg_id, text, {inline_keyboard: [[{text: "🔄 Refresh", callback_data: "act:status"}, {text: "🏠 Menu", callback_data: "menu:main"}]]});
 }
 
 function ui_settings(msg_id) {
@@ -305,12 +411,19 @@ function ui_settings(msg_id) {
 	let proxy = uci_get("lpac-esim.main.mbim_proxy", "1");
 	let skip = uci_get("lpac-esim.main.skip_slot_mapping", "1");
 	let apdu_debug = uci_get("lpac-esim.main.apdu_debug", "0");
-	let text = `⚙️ <b>lpac Backend Settings</b>\n\nBackend aktif: <b>${html(backend)}</b>\nMBIM Proxy: <b>${proxy == "1" ? "ON" : "OFF"}</b>\nSkip Slot Mapping: <b>${skip == "1" ? "ON" : "OFF"}</b>\nAPDU Debug: <b>${apdu_debug == "1" ? "ON" : "OFF"}</b>`;
+	let proxyText = proxy == "1" ? "ON" : "OFF";
+	let skipText = skip == "1" ? "ON" : "OFF";
+	let debugText = apdu_debug == "1" ? "ON" : "OFF";
+	let text = `⚙️ <b>Settings</b>
+
+<b>Backend:</b> <code>${html(backend)}</code>
+<b>MBIM Proxy:</b> ${proxyText}
+<b>Skip Slot Mapping:</b> ${skipText}
+<b>Debug:</b> ${debugText}`;
 	update_ui(msg_id, text, {inline_keyboard: [
-		[{text: `${backend == "qmi" ? "✅" : "▫️"} Backend QMI`, callback_data: "cfg:backend:qmi", style: backend == "qmi" ? "primary" : "danger"}, {text: `${backend == "mbim" ? "✅" : "▫️"} Backend MBIM`, callback_data: "cfg:backend:mbim", style: backend == "mbim" ? "primary" : "danger"}],
-		[{text: `${backend == "at" ? "✅" : "▫️"} Backend AT`, callback_data: "cfg:backend:at", style: backend == "at" ? "primary" : "danger"}],
-		[{text: `${proxy == "1" ? "✅" : "▫️"} MBIM Proxy`, callback_data: "cfg:toggle:mbim_proxy"}, {text: `${skip == "1" ? "✅" : "▫️"} Skip Slot`, callback_data: "cfg:toggle:skip_slot_mapping"}],
-		[{text: `${apdu_debug == "1" ? "✅" : "▫️"} APDU Debug`, callback_data: "cfg:toggle:apdu_debug"}],
+		[{text: "Backend QMI", callback_data: "cfg:backend:qmi", style: backend == "qmi" ? "primary" : "danger"}, {text: "Backend MBIM", callback_data: "cfg:backend:mbim", style: backend == "mbim" ? "primary" : "danger"}, {text: "Backend AT", callback_data: "cfg:backend:at", style: backend == "at" ? "primary" : "danger"}],
+		[{text: `MBIM Proxy: ${proxyText}`, callback_data: "cfg:toggle:mbim_proxy", style: proxy == "1" ? "primary" : "danger"}, {text: `Skip Slot: ${skipText}`, callback_data: "cfg:toggle:skip_slot_mapping", style: skip == "1" ? "primary" : "danger"}],
+		[{text: `Debug: ${debugText}`, callback_data: "cfg:toggle:apdu_debug", style: apdu_debug == "1" ? "primary" : "danger"}],
 		[{text: "🏠 Menu", callback_data: "menu:main"}]
 	]});
 }
@@ -339,54 +452,68 @@ function poll_lock_result(timeout) {
 function do_switch(iccid) {
 	if (!config.allow_disruptive) return tg_send("⛔ Operasi switch dinonaktifkan.");
 	let section = get_modem_section();
-	if (!section) return tg_send("❌ Modem section tidak ditemukan.");
-	let payload = sprintf("%J", {iccid: iccid, refresh: "1"});
-	tg_send(`⏳ <b>Switching Profile...</b>\nICCID: <code>${html(iccid)}</code>\n\nInternet mungkin putus sebentar.`);
-	let r = sys(`/usr/share/xmodem/esim_ctrl.sh profile_enable ${sh_quote(section)} ${sh_quote(payload)} 2>/dev/null`);
-	let parsed = esim_ctrl_result(r);
-	let kb = [[{text: "📋 Profiles", callback_data: "menu:profiles"}, {text: "🏠 Menu", callback_data: "menu:main"}]];
-	if (parsed.ok) tg_send_retry(`✅ <b>Profile Switched</b>\nICCID: <code>${html(iccid)}</code>`, kb);
-	else tg_send_retry(`❌ <b>Switch Failed</b>\nICCID: <code>${html(iccid)}</code>\n${html(parsed.error || "Unknown error")}`, kb);
+	tg_send("⏳");
+	let result = section ? sys(`/usr/share/xmodem/esim_ctrl.sh profile_enable ${sh_quote(section)} ${sh_quote(sprintf("%J", {iccid: iccid, refresh: "1"}))} 2>/dev/null`) : '{"result":{"status":"0","error":"no modem section"}}';
+	let parsed = esim_ctrl_result(result);
+	if (parsed.ok)
+		tg_send_retry(`✅ <b>Profile Switched</b>
+
+ICCID: <code>${html(iccid)}</code>
+Internet reconnected.`, [[{text: "📋 Profile List", callback_data: "menu:profiles"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]);
+	else
+		tg_send_retry(`❌ <b>Switch Failed</b>
+
+Error: ${html(parsed.error || "Unknown")}`, [[{text: "📋 Profile List", callback_data: "menu:profiles"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]);
 }
 function do_delete(iccid) {
 	if (!config.allow_disruptive) return tg_send("⛔ Operasi delete dinonaktifkan.");
-	let prof = find_profile(iccid);
-	if (prof && profile_active(prof)) return tg_send(`🔒 <b>Delete diblokir</b>\nProfile aktif tidak boleh dihapus.\nICCID: <code>${html(iccid)}</code>`, {inline_keyboard: [[{text: "📋 Profiles", callback_data: "menu:profiles"}]]});
 	let section = get_modem_section();
-	if (!section) return tg_send("❌ Modem section tidak ditemukan.");
-	let payload = sprintf("%J", {iccid: iccid});
-	tg_send(`⏳ <b>Deleting Profile...</b>\nICCID: <code>${html(iccid)}</code>`);
-	let r = sys(`/usr/share/xmodem/esim_ctrl.sh profile_delete ${sh_quote(section)} ${sh_quote(payload)} 2>/dev/null`);
-	let parsed = esim_ctrl_result(r);
-	if (parsed.ok) tg_send(`✅ <b>Profile Deleted</b>\nICCID: <code>${html(iccid)}</code>`, {inline_keyboard: [[{text: "📋 Profiles", callback_data: "menu:profiles"}]]});
-	else tg_send(`❌ <b>Delete Failed</b>\n${html(parsed.error || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+	tg_send("⏳");
+	let result = section ? sys(`/usr/share/xmodem/esim_ctrl.sh profile_delete ${sh_quote(section)} ${sh_quote(sprintf("%J", {iccid: iccid}))} 2>/dev/null`) : '{"result":{"status":"0","error":"no modem section"}}';
+	let parsed = esim_ctrl_result(result);
+	if (parsed.ok)
+		tg_send("✅ Profile deleted.", {inline_keyboard: [[{text: "📋 Profile List", callback_data: "menu:profiles"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
+	else
+		tg_send(`❌ Delete failed: ${html(parsed.error || "Unknown")}`, {inline_keyboard: INLINE_MENU});
 }
 function do_download(lpa) {
-	tg_send("⏳ <b>Downloading eSIM...</b>\n<i>Mohon tunggu.</i>");
+	tg_send("⏳");
 	let first = lpac_api("download", {lpa: lpa});
 	if (!first.success && !match(first.msg || first.error || "", /process|busy|lock|background/i)) {
-		let err = first.error || first.msg || "Download rejected by backend";
-		return tg_send(`❌ <b>Download Gagal</b>\n${html(err)}`, {inline_keyboard: [[{text: "📥 Retry", callback_data: "menu:download"}, {text: "🏠 Menu", callback_data: "menu:main"}]]});
+		let err = first.error || first.msg || "Unknown error";
+		return tg_send(`❌ <b>Download Failed</b>
+
+Error: ${html(err)}`, {inline_keyboard: [[{text: "📥 Try Again", callback_data: "menu:download"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
 	}
 	let r = poll_lock_result(180);
-	let kb = [[{text: "📋 Profiles", callback_data: "menu:profiles"}, {text: "🏠 Menu", callback_data: "menu:main"}]];
 	if (!r) {
-		let err = trim(sys(`logread | grep -iE 'lpac|download|esim' | tail -n5`));
-		if (match(err, /fail|error|denied/i)) return tg_send(`❌ <b>Download Gagal</b>\n${html(err)}`, {inline_keyboard: kb});
-		return tg_send(`⚠️ <b>Download Timeout</b>\n${html(err || "Masih diproses di latar.")}`, {inline_keyboard: kb});
+		let err = trim(sys(`logread -l 20 2>/dev/null | grep -i "lpac-esim.*FAIL\\|download.*FAILED" | tail -1 | sed 's/.*: //'`));
+		if (err) return tg_send(`❌ <b>Download Failed</b>
+
+${html(err)}`, {inline_keyboard: [[{text: "📥 Try Again", callback_data: "menu:download"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
+		return tg_send("⚠️ <b>Download timeout</b>
+
+Check Profile List for status.", {inline_keyboard: [[{text: "📋 Profile List", callback_data: "menu:profiles"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
 	}
-	if (r.success || r.message == "success") tg_send("✅ <b>Download Berhasil</b>", {inline_keyboard: kb});
-	else tg_send(`❌ <b>Download Gagal</b>\n${html(r.error || r.message || "Unknown error")}`, {inline_keyboard: kb});
+	if (r.success === false || r.success == "error" || match(r.message || r.error || "", /fail|error|FAILED/i))
+		return tg_send(`❌ <b>Download Failed</b>
+
+${html(r.message || r.error || "Unknown error")}`, {inline_keyboard: [[{text: "📥 Try Again", callback_data: "menu:download"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
+	tg_send("✅ <b>Profile Downloaded</b>
+
+Use Profile List to view and switch.", {inline_keyboard: [[{text: "📋 Profile List", callback_data: "menu:profiles"}, {text: "🔔 Process Notif", callback_data: "act:notifprocess"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
 }
 function do_notif_process() {
-	tg_send("⏳ <b>Processing Notifications...</b>");
+	tg_send("⏳");
 	let r = lpac_api("notif_process");
-	if (r.success || r.message == "success" || r.msg == "success") return tg_send("✅ <b>Notifications Processed</b>", {inline_keyboard: INLINE_MENU});
+	if (r.success || r.message == "success" || r.msg == "success")
+		return tg_send("✅ Notifications processed.", {inline_keyboard: [[{text: "📋 Profile List", callback_data: "menu:profiles"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
 	let locked = poll_lock_result(120);
-	if (!locked) return tg_send(`❌ <b>Notification Failed</b>\n${html(r.error || r.msg || "No backend result")}`, {inline_keyboard: INLINE_MENU});
-	if (locked.success || locked.message == "success") tg_send("✅ <b>Notifications Processed</b>", {inline_keyboard: INLINE_MENU});
-	else tg_send(`❌ <b>Notification Failed</b>\n${html(locked.error || locked.message || r.error || r.msg || "Unknown error")}`, {inline_keyboard: INLINE_MENU});
+	if (locked && (locked.success || locked.message == "success"))
+		return tg_send("✅ Notifications processed.", {inline_keyboard: [[{text: "📋 Profile List", callback_data: "menu:profiles"}], [{text: "🏠 Menu", callback_data: "menu:main"}]]});
+	tg_send("❌ Failed to process notifications.", {inline_keyboard: INLINE_MENU});
 }
+
 function do_simslot(slot) {
 	if (!config.allow_disruptive) return tg_send("⛔ SIM switch dinonaktifkan.");
 	let section = get_modem_section();
@@ -496,7 +623,8 @@ function handle_message(chat_id, text) {
 	if (text == "🔔 Notifications") return ui_notif(null);
 	if (text == "📡 Modem Status" || text == "/status") return ui_modem(null);
 	if (text == "⚙️ Settings" || text == "/settings") return ui_settings(null);
-	if (text == "❓ Help" || text == "/help") return ui_help();
+	if (text == "❓ Help") return ui_help();
+	if (text == "/help") return ui_help_short();
 	if (text == "🏠 Menu" || text == "Menu" || text == "Menu Utama" || text == "/start" || text == "/menu") return send_main_menu();
 	if (text == "/chatid") return tg_send(`Chat ID: <code>${html(chat_id)}</code>`);
 	if (text == "/notif") return do_notif_process();

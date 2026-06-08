@@ -13,7 +13,7 @@ define Package/$(PKG_NAME)
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Telegram bot for XModem eSIM management
-  DEPENDS:=+curl +jq +lpac
+  DEPENDS:=+ucode +curl +jq +lpac
   URL:=https://github.com/mkuruyuk/XModem
 endef
 
@@ -21,7 +21,7 @@ define Package/$(PKG_NAME)/description
   Telegram bot for remote eSIM profile management on OpenWrt.
   Supports: profile list, switch, download, delete, modem status.
   Uses long-polling (no webhook server needed).
-  Zero additional dependencies beyond curl and jq.
+  Implemented in ucode for low memory usage and fast startup.
 endef
 
 define Package/$(PKG_NAME)/conffiles
