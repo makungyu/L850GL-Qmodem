@@ -236,6 +236,8 @@ function loadEsimModules() {
 
 	// Provide showTab compatibility function
 	window.showTab = showEsimTab;
+	window.checkLockStatus = checkLockStatus;
+	window.startLockPolling = startLockPolling;
 
 	// Load each module in order, then initialize the active tab.
 	var scripts = [
@@ -252,6 +254,85 @@ function loadEsimModules() {
 		loadEsimTab('info-tab');
 		checkConnectivity();
 	});
+}
+
+var esimLockPollTimer = null;
+
+function getLockStatusData(data) {
+	if (data && data.payload && data.payload.data)
+		return data.payload.data;
+
+	if (data && data.data)
+		return data.data;
+
+	return data || {};
+}
+
+function setLockBanner(visible, text) {
+	var banner = document.getElementById('esim-lock-banner');
+	var bannerText = document.getElementById('esim-lock-text');
+
+	if (banner)
+		banner.style.display = visible ? 'block' : 'none';
+
+	if (bannerText && text)
+		bannerText.textContent = text;
+}
+
+function checkLockStatus(callback) {
+	if (typeof window.apiGet !== 'function') return Promise.resolve(null);
+
+	return window.apiGet('lock_status')
+		.then(function(data) {
+			var status = getLockStatusData(data);
+
+			if (status && status.locked) {
+				setLockBanner(true, _('Operation in progress... Please wait.'));
+				return status;
+			}
+
+			setLockBanner(false);
+			if (callback) callback(status && status.last_result ? status.last_result : null);
+			return status;
+		})
+		.catch(function() {
+			setLockBanner(false);
+			return null;
+		});
+}
+
+function startLockPolling(onUnlocked) {
+	if (esimLockPollTimer)
+		clearInterval(esimLockPollTimer);
+
+	function pollLock() {
+		if (typeof window.apiGet !== 'function') return;
+
+		window.apiGet('lock_status')
+			.then(function(data) {
+				var status = getLockStatusData(data);
+
+				if (status && status.locked) {
+					setLockBanner(true, _('Operation in progress... Please wait.'));
+					return;
+				}
+
+				setLockBanner(false);
+				if (esimLockPollTimer) {
+					clearInterval(esimLockPollTimer);
+					esimLockPollTimer = null;
+				}
+
+				if (onUnlocked)
+					onUnlocked(status && status.last_result ? status.last_result : null);
+			})
+			.catch(function() {
+				setLockBanner(true, _('Connection lost — modem may be rebooting. Waiting for recovery...'));
+			});
+	}
+
+	esimLockPollTimer = setInterval(pollLock, 5000);
+	pollLock();
 }
 
 function checkConnectivity() {
