@@ -1060,7 +1060,7 @@ mbim_wait_ready()
     while [ $i -lt $n ]; do
         sub=$(mbim_field --query-subscriber-ready-status "Ready state")
         if [ "$sub" = "initialized" ]; then
-            reg=$(mbim_field --query-register-state "Register state")
+            reg=$(mbim_field --query-registration-state "Register state")
             case "$reg" in
                 home|roaming|partner) return 0 ;;
             esac
